@@ -39,17 +39,79 @@
 - [ ] Still unverified against a real camera: the actual clip build (audio transcode to AAC from real G711 tracks) once real segments are correctly named - the live test never got past the empty-segments bug, so this specific step needs one more live pass
 
 ## v0.5 — Polish
-- [ ] Simple local web dashboard (served over the same Tailscale tunnel) to review event history/clips without needing Drive
 - [ ] Docker Compose option for NAS users
 - [ ] Docs: supported camera list, troubleshooting guide, security FAQ
 - [ ] Auto-detect Google Drive for Desktop sync folder on Windows/Linux more robustly (currently macOS-tested only)
+- [ ] Swap Flask's dev server for a real WSGI server (e.g. `waitress`) for `nomwatch ui` - current dev server is fine for local single-user use but not meant for anything beyond that
+
+## v0.6 — Setup UI (replaces CLI wizard as the primary path)
+Full spec: `docs/UI_SPEC.md`. Decision: local web app (not native/Electron),
+becomes the primary first-run/reconfigure experience; `nomwatch setup`
+(CLI) stays available underneath for power users, automation, and headless
+bridge devices - not being retired.
+- [x] Screen 1 first slice built (`nomwatch/webui.py`, `nomwatch ui` command): camera config form + local model detection/install, with hover info-icons on every field and a password show/hide toggle. Verified: real Flask app serving real HTML, `/api/check-model` responding correctly against actual Ollama state, tested live in-browser (not just via curl).
+- [ ] Real progress indicator during `ollama pull` instead of blocking until done
+- [ ] Screen 2: pre-roll/post-confirm timing controls with live debounce-math feedback
+- [ ] Screen 3: storage - pre-roll cache location (always local) and final
+      clip destination configured as INDEPENDENT choices (local / Drive
+      sync / Drive API / local+Drive / none) - requires a small config
+      model change, see UI_SPEC.md's "non-UI implication" note
+- [ ] Screen 4: notifications - plain-language ntfy explainer, App
+      Store/Play Store/web app links, generated topic with copy button +
+      QR code for phone scanning, custom topic override, Pushover as
+      alternate
+- [ ] Screen 5 (optional toggle, off by default): appearance identification
+      - ask the local vision model to describe species/color/etc. as an
+        enrichment of the feeding-event record, not a new event category
+- [ ] This also subsumes the earlier "event history/clip review" dashboard
+      idea (previously listed here as v0.5's "web dashboard") - one UI
+      covers both setup and reviewing past events, rather than two
+      separate things
+- [ ] Optional `nomwatch ui --expose` flag to auto-wire the UI over
+      `tailscale serve` the same clean way `bridge.py` already does for the
+      HLS stream - today exposing the UI remotely requires a manual
+      `tailscale serve` command
+
+## Client/viewer architecture decision
+NomWatch always requires one real host machine (Mac, and eventually
+Linux/Windows) running the bridge (MediaMTX + detection + web UI). Phones,
+tablets, and other computers are ALWAYS viewers/remote-controls only, never
+capable of running the bridge itself - iOS/iPadOS in particular can't run a
+persistent background RTSP+ffmpeg+local-model pipeline, and Apple wouldn't
+allow that as an App Store app regardless. Decisions:
+- [ ] **macOS menu-bar wrapper** - realistic and planned. Since a real Mac
+      is already required to run the bridge, wrapping the existing
+      Python/Flask tool as a small native menu-bar app (e.g. via `rumps`)
+      that starts/stops NomWatch and opens the web UI is a reasonable,
+      proportionate step - not a full rewrite.
+- **Native iOS/iPadOS app: NOT planned.** Would only ever be a
+  viewer/remote (never the bridge itself), and the ongoing cost (Apple
+  Developer Program enrollment, App Store review, a second codebase to
+  maintain) sits awkwardly against NomWatch's free/no-paid-tiers identity.
+  Instead: iOS's "Add to Home Screen" feature lets anyone turn the existing
+  web UI into a full-screen, chrome-free home-screen icon with zero extra
+  native code - effectively a free pseudo-app wrapper we already get once
+  the web UI exists. Revisit only if this decision is deliberately
+  reconsidered later, not by default feature creep.
 
 ## Stretch goals (not committed)
-- [ ] Native iOS companion app with APNs push (replacing ntfy/Pushover)
 - [ ] Pluggable storage backends beyond Google Drive (S3-compatible, local-only NAS)
 - [ ] Pluggable private-mesh backend beyond Tailscale
 - [ ] Per-pet identification (multi-pet households) via the detection layer
 - [ ] Community-contributed camera compatibility list
+- [ ] Formal host-vs-client/multi-device delegation (today it's implicit -
+      whichever machine runs `nomwatch run`/`nomwatch ui` is "the bridge" by
+      virtue of running it there; nothing coordinates multiple devices or
+      tracks a designated bridge role)
+
+## Explicitly NOT planned (recorded so the idea isn't lost, but not to be implemented without a separate product-scope conversation)
+- Generalizing detection beyond "feeding event" to arbitrary configurable
+  event types (presence, package delivery, intrusion, etc.). The
+  architecture could probably support this, but NomWatch's identity is
+  specifically a pet feeder monitor for the foreseeable future - no code
+  should branch on an "event type" concept. See `docs/UI_SPEC.md`.
+- Native iOS/iPadOS companion app - see "Client/viewer architecture
+  decision" above.
 
 ## Explicitly out of scope for the foreseeable future
 - Any NomWatch-operated cloud/account/relay service

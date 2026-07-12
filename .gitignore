@@ -18,5 +18,13 @@ token.json
 
 .DS_Store
 
+# nomwatch ui runtime artifacts (startnom/quitnom/nomstatus skills)
+.nomwatch-ui.pid
+.nomwatch-ui.port
+.nomwatch-ui.log
+
 # Obsidian (this repo doubles as a vault - don't commit its app config/workspace state)
 .obsidian/
+
+# Claude Code local skill config (personal tooling, not part of the project)
+.claude/
