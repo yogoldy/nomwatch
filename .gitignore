@@ -17,3 +17,6 @@ token.json
 *.key
 
 .DS_Store
+
+# Obsidian (this repo doubles as a vault - don't commit its app config/workspace state)
+.obsidian/
