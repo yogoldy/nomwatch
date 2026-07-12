@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# never commit secrets
+*.env
+config.yml
+config.yaml
+nomwatch.conf
+credentials.json
+token.json
+*.pem
+*.key
+
+.DS_Store
