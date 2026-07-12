@@ -467,6 +467,20 @@ def run(once: bool):
 
 
 @main.command()
+@click.option("--port", default=5151, type=int)
+def ui(port: int):
+    """Launch the local web UI (first slice: camera + model detection only - see docs/UI_SPEC.md)."""
+    try:
+        from .webui import run_ui
+    except ImportError:
+        click.echo("The web UI requires Flask. Install it with: pip install nomwatch[ui]")
+        return
+
+    click.echo(f"Starting NomWatch UI at http://127.0.0.1:{port} (Ctrl+C to stop)")
+    run_ui(port=port)
+
+
+@main.command()
 def doctor():
     """Check for required dependencies and report what's missing."""
     checks = {

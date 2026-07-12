@@ -38,6 +38,7 @@ Issues = "https://github.com/yogoldy/nomwatch/issues"
 [project.optional-dependencies]
 drive = ["google-api-python-client>=2.100", "google-auth-oauthlib>=1.1"]
 detect = ["ultralytics>=8.0"]
+ui = ["flask>=3.0"]
 
 [project.scripts]
 nomwatch = "nomwatch.cli:main"
