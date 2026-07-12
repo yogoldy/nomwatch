@@ -8,6 +8,7 @@ see cli.py's `doctor` command for install-detection and guidance.
 """
 from __future__ import annotations
 
+import platform
 import shutil
 import subprocess
 from pathlib import Path
@@ -77,6 +78,46 @@ def render_mediamtx_config(cfg: NomWatchConfig) -> str:
 
 def binary_available(name: str) -> bool:
     return shutil.which(name) is not None
+
+
+def install_ffmpeg(on_output=None) -> bool:
+    """
+    Attempts to install ffmpeg automatically. macOS: via Homebrew (fails
+    clearly if brew itself isn't installed - we don't try to install brew
+    itself, that's a bigger ask than NomWatch should make unprompted).
+    Other platforms: not attempted, caller should show manual instructions.
+    Returns True on success.
+    """
+    if platform.system() != "Darwin":
+        if on_output:
+            on_output("Automatic ffmpeg install is only wired up for macOS (via Homebrew) right now.")
+        return False
+
+    if not binary_available("brew"):
+        if on_output:
+            on_output(
+                "Homebrew isn't installed, so NomWatch can't install ffmpeg automatically. "
+                "Install Homebrew first (https://brew.sh), or install ffmpeg some other way, "
+                "then recheck."
+            )
+        return False
+
+    try:
+        process = subprocess.Popen(
+            ["brew", "install", "ffmpeg"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+    except FileNotFoundError:
+        return False
+
+    for line in process.stdout:
+        if on_output:
+            on_output(line.rstrip())
+    process.wait()
+    return process.returncode == 0 and binary_available("ffmpeg")
 
 
 def write_mediamtx_config(cfg: NomWatchConfig, path: Path) -> Path:

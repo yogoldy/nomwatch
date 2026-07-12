@@ -59,6 +59,20 @@ class DetectionConfig:
     # BridgeConfig.recordings_dir) - if that's off, pre-roll is simply 0.
     pre_roll_seconds: int = 5
     clip_post_confirm_seconds: int = 20
+    # Optional enrichment: ask the vision model to also describe what it
+    # sees (species/color/etc.) alongside the feeding judgment. Off by
+    # default. This is NOT a new event category - see docs/ROADMAP.md's
+    # "explicitly not planned" note on generalizing beyond feeding events.
+    describe_appearance: bool = False
+    # User-entered description of their pet(s) (e.g. "black cat", "golden
+    # retriever named Max") intended to help the vision model recognize the
+    # specific animal. PLACEHOLDER ONLY - not yet wired into the detection
+    # prompt in detection.py. Stored so the UI has somewhere real to save
+    # it once that wiring is built.
+    pet_description: Optional[str] = None
+    # Placeholder only - no architecture exists for this yet. Recorded here
+    # so the config shape is ready whenever it's actually built.
+    zone_detection_enabled: bool = False
 
 
 @dataclass
