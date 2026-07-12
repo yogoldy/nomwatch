@@ -35,6 +35,15 @@ class BridgeConfig:
 
 
 @dataclass
+class DetectionConfig:
+    engine: str = "ollama"  # "ollama" | "frigate" | "yolo" | "motion"
+    ollama_host: str = "http://localhost:11434"
+    ollama_model: Optional[str] = None  # auto-picked at setup time if None
+    poll_interval_seconds: int = 15
+    min_confidence: float = 0.6
+
+
+@dataclass
 class NotifyConfig:
     provider: str = "ntfy"  # "ntfy" | "pushover" | "none"
     ntfy_topic: Optional[str] = None
@@ -52,6 +61,7 @@ class StorageConfig:
 class NomWatchConfig:
     camera: CameraConfig
     bridge: BridgeConfig = field(default_factory=BridgeConfig)
+    detection: DetectionConfig = field(default_factory=DetectionConfig)
     notify: NotifyConfig = field(default_factory=NotifyConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
 
@@ -72,6 +82,7 @@ def load_config() -> Optional[NomWatchConfig]:
     return NomWatchConfig(
         camera=CameraConfig(**raw["camera"]),
         bridge=BridgeConfig(**raw.get("bridge", {})),
+        detection=DetectionConfig(**raw.get("detection", {})),
         notify=NotifyConfig(**raw.get("notify", {})),
         storage=StorageConfig(**raw.get("storage", {})),
     )
