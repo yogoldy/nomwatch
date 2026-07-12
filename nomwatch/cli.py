@@ -3,6 +3,9 @@ NomWatch CLI - `nomwatch setup`, `nomwatch status`, `nomwatch doctor`.
 """
 from __future__ import annotations
 
+import datetime
+import json
+
 import click
 
 from .bridge import binary_available, tailscale_status, write_mediamtx_config
@@ -217,6 +220,64 @@ def detect_test():
     else:
         verdict = "feeding, but below confidence threshold" if result.is_feeding else "not feeding"
         click.echo(f"❌ No feeding event ({verdict}, confidence {result.confidence:.2f}): {result.reason}")
+
+
+@main.command()
+@click.option("--once", is_flag=True, help="Run a single debounced check cycle then exit (for testing) instead of looping forever.")
+def run(once: bool):
+    """Continuously watch the camera and log feeding events (Ctrl+C to stop)."""
+    cfg = load_config()
+    if cfg is None:
+        click.echo("No config found. Run `nomwatch setup` first.")
+        return
+
+    if cfg.detection.engine != "ollama" or not cfg.detection.ollama_model:
+        click.echo(
+            f"Configured detection engine is '{cfg.detection.engine}', not 'ollama', "
+            "or no vision model was picked during setup. Run `nomwatch setup` and install "
+            "a vision model first."
+        )
+        return
+
+    stream_url = (
+        f"rtsp://{cfg.camera.username}:{cfg.camera.password}@"
+        f"{cfg.camera.ip}:{cfg.camera.rtsp_port}/{cfg.camera.stream_path}"
+    )
+    detector = OllamaVisionDetector(
+        model=cfg.detection.ollama_model,
+        host=cfg.detection.ollama_host,
+        min_confidence=cfg.detection.min_confidence,
+    )
+
+    log_path = CONFIG_DIR / "events.jsonl"
+    click.echo(
+        f"Watching {cfg.camera.ip} every {cfg.detection.poll_interval_seconds}s, "
+        f"requiring {cfg.detection.consecutive_required} consecutive positive checks "
+        f"(~{cfg.detection.consecutive_required * cfg.detection.poll_interval_seconds}s of eating) "
+        f"before logging an event. Log: {log_path}\n(Ctrl+C to stop)\n"
+    )
+
+    events = detector.poll_stream(
+        stream_url,
+        interval_seconds=cfg.detection.poll_interval_seconds,
+        consecutive_required=cfg.detection.consecutive_required,
+    )
+    try:
+        for event in events:
+            ts = datetime.datetime.fromtimestamp(event.timestamp).strftime("%Y-%m-%d %H:%M:%S")
+            click.echo(f"🐾 [{ts}] Feeding event - confidence {event.confidence:.2f}: {event.reasoning}")
+            with open(log_path, "a") as f:
+                f.write(json.dumps({
+                    "timestamp": event.timestamp,
+                    "confidence": event.confidence,
+                    "reasoning": event.reasoning,
+                }) + "\n")
+            # Notification (ntfy/Pushover) and clip upload wiring land in v0.4 -
+            # for now, a logged line + console print is the full effect of an event.
+            if once:
+                break
+    except KeyboardInterrupt:
+        click.echo("\nStopped.")
 
 
 @main.command()
