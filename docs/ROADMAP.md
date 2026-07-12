@@ -18,21 +18,26 @@
 - [x] Auto-pick a vision-capable local model (e.g. `gemma3:4b`) out of whatever's installed, ignoring text-only models
 - [x] `nomwatch detect-test`: captures one live frame via ffmpeg and runs a single classification pass through the local Ollama vision model
 - [x] Event object schema: timestamp, confidence, clip reference, camera id, reasoning string
-- [ ] Continuous polling loop wired into a long-running `nomwatch run` command (currently only a one-shot test + a `poll_stream()` generator exist)
+- [x] Continuous polling loop wired into `nomwatch run` (long-running, Ctrl+C to stop)
+- [x] Consecutive-detection debounce: user sets seconds of continuous eating required before an event fires (real-world tested: correctly ignored a single ambiguous frame, fired once per continuous feeding streak - see `scripts/simulate_poll.py`)
 - [ ] Integration path for existing open-source video-analysis tools that can consume our HLS/RTSP output (e.g. Frigate-style detectors) as an alternative detection backend
 - [ ] Bundled lightweight fallback model (YOLOv8n-class) for zero-config out-of-box detection when no local model server is present
 - [ ] Motion-only heuristic as the absolute minimum fallback
 
 ## v0.4 — Notifications + storage
-- [ ] ntfy.sh integration (default, zero-account-needed option)
-- [ ] Pushover integration (alternative)
-- [ ] Google Drive OAuth flow + upload of short event clips
-- [ ] Local event log (simple SQLite or JSON) for history/review independent of Drive
+- [x] ntfy.sh integration (default, zero-account-needed option) - fires the moment feeding is confirmed, doesn't wait for clip/upload
+- [x] Pushover integration (alternative)
+- [x] Google Drive OAuth flow + upload of event clips (`docs/GOOGLE_DRIVE_SETUP.md` walks through the one-time OAuth client setup each user needs)
+- [x] Post-confirmation clip recording (`nomwatch/clip.py`) - starts recording the moment feeding is CONFIRMED, for a user-configurable duration
+- [x] Local event log (JSONL at `~/.config/nomwatch/events.jsonl`) including clip path + Drive link per event
+- [ ] Pre-roll buffer (clip starting a few seconds *before* the first positive poll) - requires MediaMTX continuous segment recording so a clip can be stitched from `confirm_time - buffer` forward; deferred, real RTSP has no way to reach into the past otherwise
+- [ ] Verify clip recording doesn't interfere with concurrent detection polling on cameras with a low concurrent-RTSP-client limit
 
 ## v0.5 — Polish
 - [ ] Simple local web dashboard (served over the same Tailscale tunnel) to review event history/clips without needing Drive
 - [ ] Docker Compose option for NAS users
 - [ ] Docs: supported camera list, troubleshooting guide, security FAQ
+- [ ] Pre-roll buffer via MediaMTX continuous recording (see v0.4 note)
 
 ## Stretch goals (not committed)
 - [ ] Native iOS companion app with APNs push (replacing ntfy/Pushover)

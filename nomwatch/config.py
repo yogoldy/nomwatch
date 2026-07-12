@@ -47,6 +47,10 @@ class DetectionConfig:
     # Guards against a single hallucinated/ambiguous frame firing a false alert.
     consecutive_required: int = 2
     required_eating_seconds: int = 20
+    # How long (seconds) to record a clip starting the moment feeding is
+    # CONFIRMED (post-confirmation only - see clip.py for why there's no
+    # pre-roll buffer yet).
+    clip_post_confirm_seconds: int = 20
 
 
 @dataclass
@@ -61,6 +65,14 @@ class NotifyConfig:
 class StorageConfig:
     provider: str = "google_drive"  # "google_drive" | "none"
     drive_folder_id: Optional[str] = None
+    # Path to the OAuth client secret JSON downloaded from Google Cloud
+    # Console (one-time user setup, see docs/GOOGLE_DRIVE_SETUP.md).
+    # Defaults to ~/.config/nomwatch/drive_credentials.json if not set.
+    drive_credentials_path: Optional[str] = None
+    # Path where the OAuth token (obtained after first-run browser login)
+    # is cached so future uploads don't need re-auth. Defaults to
+    # ~/.config/nomwatch/drive_token.json.
+    drive_token_path: Optional[str] = None
 
 
 @dataclass

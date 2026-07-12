@@ -9,12 +9,15 @@ import json
 import click
 
 from .bridge import binary_available, tailscale_status, write_mediamtx_config
+from .clip import record_clip
 from .config import (
     BridgeConfig,
     CameraConfig,
     CONFIG_DIR,
     DetectionConfig,
     NomWatchConfig,
+    NotifyConfig,
+    StorageConfig,
     load_config,
     save_config,
 )
@@ -28,6 +31,8 @@ from .detection import (
     probe_local_model_server,
     pull_model,
 )
+from .notify import build_notifier
+from .storage import build_storage_backend
 
 
 @click.group()
@@ -118,6 +123,39 @@ def setup():
         )
         detection_cfg.engine = "motion"
 
+    detection_cfg.clip_post_confirm_seconds = click.prompt(
+        "How many seconds of clip should be recorded once feeding is confirmed? "
+        "(recording starts at confirmation, not before - no pre-roll buffer yet)",
+        default=detection_cfg.clip_post_confirm_seconds,
+        type=int,
+    )
+
+    notify_cfg = NotifyConfig()
+    if click.confirm("\nSet up push notifications now (via ntfy.sh, free, no account needed)?", default=True):
+        notify_cfg.provider = "ntfy"
+        notify_cfg.ntfy_topic = click.prompt(
+            "Pick an ntfy topic name (make it hard to guess - anyone who knows it can read your "
+            "notifications, e.g. 'nomwatch-yourname-8f3k2')"
+        )
+        click.echo(
+            f"-> Subscribe to this topic in the ntfy app (iOS/Android) or at "
+            f"https://ntfy.sh/{notify_cfg.ntfy_topic} to receive alerts."
+        )
+    else:
+        notify_cfg.provider = "none"
+
+    storage_cfg = StorageConfig()
+    if click.confirm("\nUpload event clips to Google Drive?", default=True):
+        storage_cfg.provider = "google_drive"
+        if click.confirm("Do you have a Drive folder ID to upload into (optional)?", default=False):
+            storage_cfg.drive_folder_id = click.prompt("Drive folder ID")
+        click.echo(
+            "-> One-time setup required before this works: see docs/GOOGLE_DRIVE_SETUP.md "
+            "to create a free OAuth client and save it to ~/.config/nomwatch/drive_credentials.json"
+        )
+    else:
+        storage_cfg.provider = "none"
+
     cfg = NomWatchConfig(
         camera=CameraConfig(
             ip=ip,
@@ -128,6 +166,8 @@ def setup():
         ),
         bridge=BridgeConfig(),
         detection=detection_cfg,
+        notify=notify_cfg,
+        storage=storage_cfg,
     )
 
     path = save_config(cfg)
@@ -249,12 +289,18 @@ def run(once: bool):
         min_confidence=cfg.detection.min_confidence,
     )
 
+    notifier = build_notifier(cfg.notify)
+    storage_backend = build_storage_backend(cfg.storage)
+    clips_dir = CONFIG_DIR / "clips"
+
     log_path = CONFIG_DIR / "events.jsonl"
     click.echo(
         f"Watching {cfg.camera.ip} every {cfg.detection.poll_interval_seconds}s, "
         f"requiring {cfg.detection.consecutive_required} consecutive positive checks "
         f"(~{cfg.detection.consecutive_required * cfg.detection.poll_interval_seconds}s of eating) "
-        f"before logging an event. Log: {log_path}\n(Ctrl+C to stop)\n"
+        f"before logging an event. Log: {log_path}\n"
+        f"Notifications: {cfg.notify.provider} | Storage: {cfg.storage.provider}\n"
+        "(Ctrl+C to stop)\n"
     )
 
     events = detector.poll_stream(
@@ -265,15 +311,48 @@ def run(once: bool):
     try:
         for event in events:
             ts = datetime.datetime.fromtimestamp(event.timestamp).strftime("%Y-%m-%d %H:%M:%S")
-            click.echo(f"🐾 [{ts}] Feeding event - confidence {event.confidence:.2f}: {event.reasoning}")
+            click.echo(f"🐾 [{ts}] Feeding event confirmed - confidence {event.confidence:.2f}: {event.reasoning}")
+
+            record = {
+                "timestamp": event.timestamp,
+                "confidence": event.confidence,
+                "reasoning": event.reasoning,
+                "clip_path": None,
+                "drive_link": None,
+            }
+
+            # Notify immediately at confirmation - don't make the user wait
+            # for clip recording/upload to hear about it.
+            if notifier:
+                notifier.send(
+                    "NomWatch: feeding detected",
+                    f"Confidence {event.confidence:.2f}. {event.reasoning}",
+                )
+
+            # Record the post-confirmation clip (blocking - see clip.py for
+            # why there's no pre-roll buffer yet).
+            if cfg.detection.clip_post_confirm_seconds > 0:
+                click.echo(f"   Recording {cfg.detection.clip_post_confirm_seconds}s clip...")
+                clip_path = record_clip(
+                    stream_url, cfg.detection.clip_post_confirm_seconds, out_dir=clips_dir
+                )
+                if clip_path:
+                    record["clip_path"] = str(clip_path)
+                    click.echo(f"   Clip saved: {clip_path}")
+
+                    if storage_backend:
+                        try:
+                            link = storage_backend.upload_clip(clip_path)
+                            record["drive_link"] = link
+                            click.echo(f"   Uploaded: {link}")
+                        except Exception as exc:  # noqa: BLE001 - report, don't crash the loop
+                            click.echo(f"   ⚠️  Upload failed: {exc}")
+                else:
+                    click.echo("   ⚠️  Clip recording failed (check ffmpeg/camera reachability).")
+
             with open(log_path, "a") as f:
-                f.write(json.dumps({
-                    "timestamp": event.timestamp,
-                    "confidence": event.confidence,
-                    "reasoning": event.reasoning,
-                }) + "\n")
-            # Notification (ntfy/Pushover) and clip upload wiring land in v0.4 -
-            # for now, a logged line + console print is the full effect of an event.
+                f.write(json.dumps(record) + "\n")
+
             if once:
                 break
     except KeyboardInterrupt:
