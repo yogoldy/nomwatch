@@ -32,6 +32,12 @@ class BridgeConfig:
     mediamtx_hls_port: int = 8888
     mediamtx_rtsp_port: int = 8554
     tailscale_hostname: Optional[str] = None  # auto-detected if None
+    # Continuous local segment recording (enables real pre-roll clips - see
+    # clip.py). Segments are small rolling mp4 files, auto-deleted after
+    # record_retention_seconds so this doesn't grow unbounded.
+    recordings_dir: Optional[str] = None  # defaults to ~/.config/nomwatch/recordings
+    record_segment_seconds: int = 5
+    record_retention_seconds: int = 120
 
 
 @dataclass
@@ -47,9 +53,11 @@ class DetectionConfig:
     # Guards against a single hallucinated/ambiguous frame firing a false alert.
     consecutive_required: int = 2
     required_eating_seconds: int = 20
-    # How long (seconds) to record a clip starting the moment feeding is
-    # CONFIRMED (post-confirmation only - see clip.py for why there's no
-    # pre-roll buffer yet).
+    # Clip window around a confirmed event: `pre_roll_seconds` before the
+    # first positive poll in the streak, `clip_post_confirm_seconds` after
+    # confirmation. Pre-roll requires continuous local recording (see
+    # BridgeConfig.recordings_dir) - if that's off, pre-roll is simply 0.
+    pre_roll_seconds: int = 5
     clip_post_confirm_seconds: int = 20
 
 
@@ -63,15 +71,22 @@ class NotifyConfig:
 
 @dataclass
 class StorageConfig:
-    provider: str = "google_drive"  # "google_drive" | "none"
+    # "local"            - just save clips to a local folder, no cloud at all
+    # "google_drive_sync" - copy into the Google Drive for Desktop sync folder
+    #                       (zero setup: reuses whatever Google account the
+    #                       user already signed into that app with)
+    # "google_drive_api"  - full OAuth/API upload (advanced; requires the
+    #                       user to create their own Google Cloud OAuth
+    #                       client, see docs/GOOGLE_DRIVE_SETUP.md)
+    # "none"
+    provider: str = "local"
+
+    local_save_dir: Optional[str] = None  # defaults to ~/.config/nomwatch/clips
+
+    drive_sync_folder: Optional[str] = None  # auto-detected if None
+
     drive_folder_id: Optional[str] = None
-    # Path to the OAuth client secret JSON downloaded from Google Cloud
-    # Console (one-time user setup, see docs/GOOGLE_DRIVE_SETUP.md).
-    # Defaults to ~/.config/nomwatch/drive_credentials.json if not set.
     drive_credentials_path: Optional[str] = None
-    # Path where the OAuth token (obtained after first-run browser login)
-    # is cached so future uploads don't need re-auth. Defaults to
-    # ~/.config/nomwatch/drive_token.json.
     drive_token_path: Optional[str] = None
 
 

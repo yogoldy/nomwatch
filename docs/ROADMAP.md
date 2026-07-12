@@ -30,14 +30,15 @@
 - [x] Google Drive OAuth flow + upload of event clips (`docs/GOOGLE_DRIVE_SETUP.md` walks through the one-time OAuth client setup each user needs)
 - [x] Post-confirmation clip recording (`nomwatch/clip.py`) - starts recording the moment feeding is CONFIRMED, for a user-configurable duration
 - [x] Local event log (JSONL at `~/.config/nomwatch/events.jsonl`) including clip path + Drive link per event
-- [ ] Pre-roll buffer (clip starting a few seconds *before* the first positive poll) - requires MediaMTX continuous segment recording so a clip can be stitched from `confirm_time - buffer` forward; deferred, real RTSP has no way to reach into the past otherwise
-- [ ] Verify clip recording doesn't interfere with concurrent detection polling on cameras with a low concurrent-RTSP-client limit
+- [x] Real pre-roll buffer: MediaMTX continuously records rolling local segments (auto-deleted after a short retention window); on a confirmed event, segments are stitched into a clip spanning `confirm_time - pre_roll_seconds` through `confirm_time + clip_post_confirm_seconds`. Verified against synthetic segments (15.2s clip against an expected ~15s window). No second RTSP connection needed for clips at all when this is enabled, since MediaMTX is already recording continuously.
+- [x] Storage options without requiring a Google Cloud project: `local` (just a folder, zero setup) and `google_drive_sync` (copies into the Google Drive for Desktop app's sync folder, reusing whatever account is already signed in - zero OAuth). The original `google_drive_api` OAuth flow is kept as an advanced/headless option, not the default.
+- [ ] Verify clip recording doesn't interfere with concurrent detection polling on cameras with a low concurrent-RTSP-client limit (moot when pre-roll/continuous recording is enabled, since detection and recording no longer need separate connections - still relevant for the pre-roll-off fallback path)
 
 ## v0.5 — Polish
 - [ ] Simple local web dashboard (served over the same Tailscale tunnel) to review event history/clips without needing Drive
 - [ ] Docker Compose option for NAS users
 - [ ] Docs: supported camera list, troubleshooting guide, security FAQ
-- [ ] Pre-roll buffer via MediaMTX continuous recording (see v0.4 note)
+- [ ] Auto-detect Google Drive for Desktop sync folder on Windows/Linux more robustly (currently macOS-tested only)
 
 ## Stretch goals (not committed)
 - [ ] Native iOS companion app with APNs push (replacing ntfy/Pushover)

@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import datetime
 import json
+import time
+from pathlib import Path
 
 import click
 
 from .bridge import binary_available, tailscale_status, write_mediamtx_config
-from .clip import record_clip
+from .clip import build_clip_with_preroll, record_clip
 from .config import (
     BridgeConfig,
     CameraConfig,
@@ -32,7 +34,7 @@ from .detection import (
     pull_model,
 )
 from .notify import build_notifier
-from .storage import build_storage_backend
+from .storage import build_storage_backend, find_google_drive_sync_folder
 
 
 @click.group()
@@ -123,12 +125,23 @@ def setup():
         )
         detection_cfg.engine = "motion"
 
+    detection_cfg.pre_roll_seconds = click.prompt(
+        "How many seconds of video BEFORE the pet arrives should clips include? "
+        "(0 disables pre-roll and skips continuous local recording entirely)",
+        default=detection_cfg.pre_roll_seconds,
+        type=int,
+    )
     detection_cfg.clip_post_confirm_seconds = click.prompt(
-        "How many seconds of clip should be recorded once feeding is confirmed? "
-        "(recording starts at confirmation, not before - no pre-roll buffer yet)",
+        "How many seconds of clip should be recorded AFTER feeding is confirmed?",
         default=detection_cfg.clip_post_confirm_seconds,
         type=int,
     )
+    if detection_cfg.pre_roll_seconds > 0:
+        click.echo(
+            "-> MediaMTX will continuously record short local segments in the background so "
+            "pre-roll is possible (auto-deleted after a couple minutes - this is not a full "
+            "always-on recording, just a rolling buffer)."
+        )
 
     notify_cfg = NotifyConfig()
     if click.confirm("\nSet up push notifications now (via ntfy.sh, free, no account needed)?", default=True):
@@ -144,15 +157,47 @@ def setup():
     else:
         notify_cfg.provider = "none"
 
+    click.echo(
+        "\nWhere should event clips go?\n"
+        "  1) Local folder only - no cloud, no accounts, zero setup\n"
+        "  2) Google Drive, via the Drive for Desktop app you already have installed/signed in "
+        "(zero extra setup - just copies into its sync folder)\n"
+        "  3) Google Drive, via direct API upload (advanced - requires creating your own free "
+        "Google Cloud OAuth client, see docs/GOOGLE_DRIVE_SETUP.md)\n"
+        "  4) None"
+    )
+    storage_choice = click.prompt("Choice", type=click.Choice(["1", "2", "3", "4"]), default="1")
+
     storage_cfg = StorageConfig()
-    if click.confirm("\nUpload event clips to Google Drive?", default=True):
-        storage_cfg.provider = "google_drive"
+    if storage_choice == "1":
+        storage_cfg.provider = "local"
+        click.echo(f"-> Clips will be saved to {CONFIG_DIR / 'clips'}")
+
+    elif storage_choice == "2":
+        storage_cfg.provider = "google_drive_sync"
+        detected = find_google_drive_sync_folder()
+        if detected:
+            click.echo(f"-> Found Google Drive for Desktop sync folder: {detected}")
+            storage_cfg.drive_sync_folder = str(detected)
+        else:
+            click.echo(
+                "-> Couldn't auto-detect a Google Drive for Desktop sync folder. Make sure "
+                "it's installed and signed in (https://www.google.com/drive/download/), or "
+                "enter its 'My Drive' path manually now."
+            )
+            manual_path = click.prompt("Path (leave blank to configure later)", default="", show_default=False)
+            if manual_path:
+                storage_cfg.drive_sync_folder = manual_path
+
+    elif storage_choice == "3":
+        storage_cfg.provider = "google_drive_api"
         if click.confirm("Do you have a Drive folder ID to upload into (optional)?", default=False):
             storage_cfg.drive_folder_id = click.prompt("Drive folder ID")
         click.echo(
             "-> One-time setup required before this works: see docs/GOOGLE_DRIVE_SETUP.md "
             "to create a free OAuth client and save it to ~/.config/nomwatch/drive_credentials.json"
         )
+
     else:
         storage_cfg.provider = "none"
 
@@ -329,13 +374,35 @@ def run(once: bool):
                     f"Confidence {event.confidence:.2f}. {event.reasoning}",
                 )
 
-            # Record the post-confirmation clip (blocking - see clip.py for
-            # why there's no pre-roll buffer yet).
-            if cfg.detection.clip_post_confirm_seconds > 0:
-                click.echo(f"   Recording {cfg.detection.clip_post_confirm_seconds}s clip...")
-                clip_path = record_clip(
-                    stream_url, cfg.detection.clip_post_confirm_seconds, out_dir=clips_dir
-                )
+            # Build the clip. If pre-roll is enabled, MediaMTX has been
+            # continuously recording segments in the background the whole
+            # time - wait out the post-confirm window, then stitch together
+            # whichever segments cover [confirm_time - pre_roll, confirm_time
+            # + post_confirm]. Otherwise, fall back to a simple forward-only
+            # recording starting right now.
+            if cfg.detection.clip_post_confirm_seconds > 0 or cfg.detection.pre_roll_seconds > 0:
+                if cfg.detection.pre_roll_seconds > 0:
+                    recordings_dir = Path(cfg.bridge.recordings_dir or (CONFIG_DIR / "recordings"))
+                    click.echo(
+                        f"   Waiting {cfg.detection.clip_post_confirm_seconds}s, then building a clip "
+                        f"({cfg.detection.pre_roll_seconds}s pre-roll + "
+                        f"{cfg.detection.clip_post_confirm_seconds}s post-confirm)..."
+                    )
+                    time.sleep(cfg.detection.clip_post_confirm_seconds)
+                    clip_path = build_clip_with_preroll(
+                        recordings_dir,
+                        "cam",
+                        event.timestamp,
+                        cfg.detection.pre_roll_seconds,
+                        cfg.detection.clip_post_confirm_seconds,
+                        out_dir=clips_dir,
+                    )
+                else:
+                    click.echo(f"   Recording {cfg.detection.clip_post_confirm_seconds}s clip (no pre-roll)...")
+                    clip_path = record_clip(
+                        stream_url, cfg.detection.clip_post_confirm_seconds, out_dir=clips_dir
+                    )
+
                 if clip_path:
                     record["clip_path"] = str(clip_path)
                     click.echo(f"   Clip saved: {clip_path}")
