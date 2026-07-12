@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 import stat
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict, field, fields
 from pathlib import Path
 from typing import Optional
 
@@ -16,6 +16,25 @@ import yaml
 
 CONFIG_DIR = Path(os.path.expanduser("~/.config/nomwatch"))
 CONFIG_PATH = CONFIG_DIR / "config.yml"
+
+
+def clean_user_path(raw: Optional[str]) -> Optional[str]:
+    """
+    Normalizes a user-typed filesystem path: strips whitespace and any
+    wrapping/stray quotes (a real user pasted '/Users/... Events' WITH the
+    quotes, and NomWatch created a literal `'` directory tree relative to
+    its own CWD and silently saved clips there), expands ~ and $VARS.
+    Returns None for empty input. Callers that need an absolute path should
+    check .startswith("/") (or Path.is_absolute) and reject otherwise -
+    a relative path would resolve against whatever CWD the daemon happens
+    to have, which is never what the user meant.
+    """
+    if raw is None:
+        return None
+    cleaned = str(raw).strip().strip("'\"").strip()
+    if not cleaned:
+        return None
+    return os.path.expandvars(os.path.expanduser(cleaned))
 
 
 @dataclass
@@ -121,15 +140,32 @@ def save_config(cfg: NomWatchConfig) -> Path:
     return CONFIG_PATH
 
 
+def _known_fields(cls, raw: dict) -> dict:
+    """
+    Drops keys a dataclass doesn't know about instead of crashing with a
+    TypeError - keeps configs written by a newer/older NomWatch loadable
+    (extra keys are simply ignored; missing ones get defaults).
+    """
+    names = {f.name for f in fields(cls)}
+    return {k: v for k, v in (raw or {}).items() if k in names}
+
+
+def config_from_dict(raw: dict) -> NomWatchConfig:
+    """Builds a NomWatchConfig from a parsed YAML dict, tolerating unknown keys."""
+    return NomWatchConfig(
+        camera=CameraConfig(**_known_fields(CameraConfig, raw.get("camera", {}))),
+        bridge=BridgeConfig(**_known_fields(BridgeConfig, raw.get("bridge", {}))),
+        detection=DetectionConfig(**_known_fields(DetectionConfig, raw.get("detection", {}))),
+        notify=NotifyConfig(**_known_fields(NotifyConfig, raw.get("notify", {}))),
+        storage=StorageConfig(**_known_fields(StorageConfig, raw.get("storage", {}))),
+    )
+
+
 def load_config() -> Optional[NomWatchConfig]:
     if not CONFIG_PATH.exists():
         return None
     with open(CONFIG_PATH) as f:
         raw = yaml.safe_load(f)
-    return NomWatchConfig(
-        camera=CameraConfig(**raw["camera"]),
-        bridge=BridgeConfig(**raw.get("bridge", {})),
-        detection=DetectionConfig(**raw.get("detection", {})),
-        notify=NotifyConfig(**raw.get("notify", {})),
-        storage=StorageConfig(**raw.get("storage", {})),
-    )
+    if not isinstance(raw, dict) or "camera" not in raw:
+        return None
+    return config_from_dict(raw)

@@ -5,13 +5,14 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 import platform
 import time
 from pathlib import Path
 
 import click
 
-from .bridge import binary_available, tailscale_status, write_mediamtx_config
+from .bridge import binary_available, rtsp_url, tailscale_status, write_mediamtx_config
 from .clip import build_clip_with_preroll, record_clip
 from .config import (
     BridgeConfig,
@@ -316,10 +317,7 @@ def detect_test():
         )
         return
 
-    stream_url = (
-        f"rtsp://{cfg.camera.username}:{cfg.camera.password}@"
-        f"{cfg.camera.ip}:{cfg.camera.rtsp_port}/{cfg.camera.stream_path}"
-    )
+    stream_url = rtsp_url(cfg)
     click.echo(f"Capturing a frame from {cfg.camera.ip}:{cfg.camera.rtsp_port}/{cfg.camera.stream_path} ...")
     frame = capture_frame(stream_url)
     if frame is None:
@@ -364,10 +362,7 @@ def run(once: bool):
         )
         return
 
-    stream_url = (
-        f"rtsp://{cfg.camera.username}:{cfg.camera.password}@"
-        f"{cfg.camera.ip}:{cfg.camera.rtsp_port}/{cfg.camera.stream_path}"
-    )
+    stream_url = rtsp_url(cfg)
     detector = OllamaVisionDetector(
         model=cfg.detection.ollama_model,
         host=cfg.detection.ollama_host,
@@ -375,8 +370,35 @@ def run(once: bool):
     )
 
     notifier = build_notifier(cfg.notify)
-    storage_backend = build_storage_backend(cfg.storage)
+    try:
+        storage_backend = build_storage_backend(cfg.storage)
+        storage_error = None
+    except Exception as exc:  # noqa: BLE001 - a bad storage config must not kill monitoring
+        # e.g. google_drive_sync chosen but the Drive for Desktop folder
+        # doesn't exist (anymore). Previously this crashed the whole loop AT
+        # STARTUP - the UI would say "started", the process died a second
+        # later, and no feeding event was ever detected again. Fall back to
+        # plain local storage so events/clips keep working, and surface the
+        # problem in the heartbeat so the dashboard can show it.
+        storage_backend = build_storage_backend(StorageConfig(provider="local"))
+        storage_error = f"storage backend '{cfg.storage.provider}' failed ({exc}); falling back to local clips folder"
+        click.echo(f"⚠️  {storage_error}")
     clips_dir = CONFIG_DIR / "clips"
+
+    heartbeat_path = CONFIG_DIR / "heartbeat.json"
+
+    def write_heartbeat(status: dict) -> None:
+        """Atomic write so the dashboard never reads a half-written file."""
+        payload = {
+            "ts": time.time(),
+            "pid": os.getpid(),
+            "poll_interval_seconds": cfg.detection.poll_interval_seconds,
+            "storage_error": storage_error,
+            **status,
+        }
+        tmp_path = heartbeat_path.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(payload))
+        tmp_path.replace(heartbeat_path)
 
     log_path = CONFIG_DIR / "events.jsonl"
     click.echo(
@@ -392,6 +414,7 @@ def run(once: bool):
         stream_url,
         interval_seconds=cfg.detection.poll_interval_seconds,
         consecutive_required=cfg.detection.consecutive_required,
+        on_poll=write_heartbeat,
     )
     try:
         for event in events:
@@ -404,15 +427,22 @@ def run(once: bool):
                 "reasoning": event.reasoning,
                 "clip_path": None,
                 "drive_link": None,
+                "notified": None,
+                "error": None,
             }
 
             # Notify immediately at confirmation - don't make the user wait
-            # for clip recording/upload to hear about it.
+            # for clip recording/upload to hear about it. Record whether the
+            # push actually went through - a failed send used to vanish
+            # without a trace.
             if notifier:
-                notifier.send(
+                record["notified"] = notifier.send(
                     "NomWatch: feeding detected",
                     f"Confidence {event.confidence:.2f}. {event.reasoning}",
                 )
+                if not record["notified"]:
+                    click.echo("   ⚠️  Push notification failed to send (network/provider problem).")
+                    record["error"] = "push notification failed to send"
 
             # Build the clip. If pre-roll is enabled, MediaMTX has been
             # continuously recording segments in the background the whole
@@ -421,14 +451,27 @@ def run(once: bool):
             # + post_confirm]. Otherwise, fall back to a simple forward-only
             # recording starting right now.
             if cfg.detection.clip_post_confirm_seconds > 0 or cfg.detection.pre_roll_seconds > 0:
+                write_heartbeat({"ok": True, "phase": "recording clip"})
                 if cfg.detection.pre_roll_seconds > 0:
-                    recordings_dir = Path(cfg.bridge.recordings_dir or (CONFIG_DIR / "recordings"))
+                    from .config import clean_user_path
+
+                    recordings_dir = Path(
+                        clean_user_path(cfg.bridge.recordings_dir) or (CONFIG_DIR / "recordings")
+                    )
                     click.echo(
                         f"   Waiting {cfg.detection.clip_post_confirm_seconds}s, then building a clip "
                         f"({cfg.detection.pre_roll_seconds}s pre-roll + "
                         f"{cfg.detection.clip_post_confirm_seconds}s post-confirm)..."
                     )
-                    time.sleep(cfg.detection.clip_post_confirm_seconds)
+                    # Wait out the post-confirm window PLUS one full segment
+                    # length: MediaMTX only finalizes a segment file when it
+                    # rolls over to the next one, so sleeping exactly
+                    # post_confirm seconds means the tail of the clip window
+                    # is often still inside an unflushed, unreadable segment.
+                    time.sleep(
+                        cfg.detection.clip_post_confirm_seconds
+                        + cfg.bridge.record_segment_seconds + 1
+                    )
                     clip_path = build_clip_with_preroll(
                         recordings_dir,
                         "cam",
@@ -437,6 +480,24 @@ def run(once: bool):
                         cfg.detection.clip_post_confirm_seconds,
                         out_dir=clips_dir,
                     )
+                    if clip_path is None:
+                        # No MediaMTX segments were found covering the needed
+                        # window - most commonly because MediaMTX isn't
+                        # actually continuously recording yet (just started,
+                        # was started before pre-roll was enabled in config,
+                        # or recordings_dir doesn't match what MediaMTX is
+                        # writing to). Rather than silently giving up and
+                        # uploading nothing, fall back to a plain forward-only
+                        # recording so the user still gets SOMETHING.
+                        click.echo(
+                            "   ⚠️  No pre-roll segments found (check that MediaMTX is actually running "
+                            "with recording enabled - restart it after changing detection settings). "
+                            "Falling back to a post-confirm-only clip..."
+                        )
+                        record["error"] = "pre-roll segments not found; used post-confirm-only fallback"
+                        clip_path = record_clip(
+                            stream_url, cfg.detection.clip_post_confirm_seconds, out_dir=clips_dir
+                        )
                 else:
                     click.echo(f"   Recording {cfg.detection.clip_post_confirm_seconds}s clip (no pre-roll)...")
                     clip_path = record_clip(
@@ -448,14 +509,32 @@ def run(once: bool):
                     click.echo(f"   Clip saved: {clip_path}")
 
                     if storage_backend:
-                        try:
-                            link = storage_backend.upload_clip(clip_path)
-                            record["drive_link"] = link
-                            click.echo(f"   Uploaded: {link}")
-                        except Exception as exc:  # noqa: BLE001 - report, don't crash the loop
-                            click.echo(f"   ⚠️  Upload failed: {exc}")
+                        # Retry with backoff instead of one shot - clip
+                        # storage is the whole point of the event, and a
+                        # momentary Drive-sync hiccup shouldn't lose it.
+                        last_exc = None
+                        for attempt in range(3):
+                            try:
+                                link = storage_backend.upload_clip(clip_path)
+                                record["drive_link"] = link
+                                click.echo(f"   Uploaded: {link}")
+                                last_exc = None
+                                break
+                            except Exception as exc:  # noqa: BLE001 - report, don't crash the loop
+                                last_exc = exc
+                                if attempt < 2:
+                                    wait = 5 * (2 ** attempt)
+                                    click.echo(f"   ⚠️  Upload attempt {attempt + 1} failed ({exc}), retrying in {wait}s...")
+                                    time.sleep(wait)
+                        if last_exc is not None:
+                            click.echo(f"   ⚠️  Upload failed after 3 attempts: {last_exc}")
+                            record["error"] = f"upload failed after 3 attempts: {last_exc}"
+                    else:
+                        click.echo("   (No storage backend configured - clip saved locally only, not uploaded.)")
                 else:
-                    click.echo("   ⚠️  Clip recording failed (check ffmpeg/camera reachability).")
+                    click.echo("   ⚠️  Clip recording failed entirely (check ffmpeg/camera reachability).")
+                    if not record["error"]:
+                        record["error"] = "clip recording failed (see run.out.log)"
 
             with open(log_path, "a") as f:
                 f.write(json.dumps(record) + "\n")

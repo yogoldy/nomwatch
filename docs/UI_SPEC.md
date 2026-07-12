@@ -1,5 +1,11 @@
 # Setup UI Spec
 
+> **Status note (2026-07-12):** the wizard + dashboard described here are
+> built and live-tested - see `docs/ROADMAP.md` v0.6 for exactly what
+> shipped vs. what remains (notably: screen 3 shipped with a single final
+> destination rather than the independent local-AND-Drive combination
+> below, and screen 5 exists only as a labeled placeholder).
+
 NomWatch's first-run and reconfiguration experience is moving from CLI
 prompts (`nomwatch setup`) to a local web app. The CLI wizard stays as-is
 underneath for power users, automation, and headless bridge devices - the

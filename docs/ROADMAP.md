@@ -36,7 +36,9 @@
 - [x] Storage options without requiring a Google Cloud project: `local` (just a folder, zero setup) and `google_drive_sync` (copies into the Google Drive for Desktop app's sync folder, reusing whatever account is already signed in - zero OAuth). The original `google_drive_api` OAuth flow is kept as an advanced/headless option, not the default.
 - [x] **Bug fixed (found via real live test against actual MediaMTX output, not synthetic segments):** `bridge.py`'s `recordPath` hardcoded a trailing `.mp4`, but MediaMTX already appends its own extension based on `recordFormat` - this produced `....mp4.mp4` filenames that silently broke `clip.py`'s filename regex, making `find_segments_covering()` return empty and pre-roll clip building fail 100% of the time against a real camera (while passing fine against hand-named synthetic test files). Fixed by removing the hardcoded extension; re-verified the regex correctly parses real-shaped filenames and correctly rejects the old buggy double-extension form.
 - [ ] Verify clip recording doesn't interfere with concurrent detection polling on cameras with a low concurrent-RTSP-client limit (moot when pre-roll/continuous recording is enabled, since detection and recording no longer need separate connections - still relevant for the pre-roll-off fallback path)
-- [ ] Still unverified against a real camera: the actual clip build (audio transcode to AAC from real G711 tracks) once real segments are correctly named - the live test never got past the empty-segments bug, so this specific step needs one more live pass
+- [x] ~~Still unverified against a real camera: the actual clip build (audio transcode to AAC from real G711 tracks)~~ VERIFIED live (2026-07-12): two real feeding events produced stitched pre-roll clips off actual MediaMTX segments - ffprobe confirms h264 video + AAC audio, 12.6s duration against an expected ~13s window (5s pre-roll + 8s post-confirm)
+- [x] Upload retries with backoff (3 attempts) instead of a one-shot attempt; push notification send failures are caught (they used to be able to crash the whole monitoring loop) and recorded on the event
+- [x] Clip-window flush fix: the loop now waits one extra segment length after the post-confirm window before stitching, since MediaMTX only finalizes a segment file when it rolls to the next one - previously the tail of the clip window could still be inside an unflushed segment
 
 ## v0.5 — Polish
 - [ ] Docker Compose option for NAS users
@@ -50,23 +52,34 @@ becomes the primary first-run/reconfigure experience; `nomwatch setup`
 (CLI) stays available underneath for power users, automation, and headless
 bridge devices - not being retired.
 - [x] Screen 1 first slice built (`nomwatch/webui.py`, `nomwatch ui` command): camera config form + local model detection/install, with hover info-icons on every field and a password show/hide toggle. Verified: real Flask app serving real HTML, `/api/check-model` responding correctly against actual Ollama state, tested live in-browser (not just via curl).
+- [x] All 6 wizard screens + dashboard shipped and live-tested against real hardware (real Tapo camera, real Ollama, real ntfy pushes, real MediaMTX recording)
+- [x] Dashboard heartbeat: the monitoring loop writes `~/.config/nomwatch/heartbeat.json` after every poll (atomic write); the dashboard shows "last check Ns ago + what the model saw" and warns if the loop looks hung - directly answers "is this thing actually working"
+- [x] Stale-settings detection: pid files record start time; the dashboard warns when config.yml was saved AFTER MediaMTX/monitoring started (i.e. the process is running with old settings) with a one-click restart - the exact failure mode behind the previous two bug reports
+- [x] Clip gallery on the dashboard: per-event thumbnails (ffmpeg-generated, cached), in-browser playback (HTTP range serving), download, and delete - subsumes the earlier "event history/clip review dashboard" idea
+- [x] Config backup/restore on the dashboard (download config.yml / upload + validate + regenerate mediamtx.yml)
+- [x] Camera troubleshooting: failed "test connection" now runs a TCP probe + parses ffmpeg stderr to distinguish wrong-IP / RTSP-off-or-wrong-port / wrong-credentials / wrong-stream-path, each with concrete next steps (verified live against the real camera in all four failure modes)
+- [x] Duplicate-monitor protection: the dashboard detects `nomwatch run` processes started outside the UI (launchd service, stray terminal) and refuses to start a second loop that would double every notification
+- [x] Security hardening: mediamtx.yml (contains RTSP credentials) now written 0600; RTSP credentials percent-encoded in all URLs (special chars in passwords used to silently break the stream); MediaMTX/monitoring launched with CWD pinned to the config dir (MediaMTX was dropping auto-generated cert files into whatever directory the UI was started from); user-typed paths sanitized (a quoted paste created a literal `'` directory tree and clips silently went to the wrong place - found live)
+- [x] Mobile-responsive dashboard + wizard (viewport meta + responsive layout), for checking on the pet from a phone
 - [ ] Real progress indicator during `ollama pull` instead of blocking until done
-- [ ] Screen 2: pre-roll/post-confirm timing controls with live debounce-math feedback
-- [ ] Screen 3: storage - pre-roll cache location (always local) and final
-      clip destination configured as INDEPENDENT choices (local / Drive
-      sync / Drive API / local+Drive / none) - requires a small config
-      model change, see UI_SPEC.md's "non-UI implication" note
-- [ ] Screen 4: notifications - plain-language ntfy explainer, App
-      Store/Play Store/web app links, generated topic with copy button +
-      QR code for phone scanning, custom topic override, Pushover as
-      alternate
+- [x] Screen 2: pre-roll/post-confirm timing controls with live debounce-math feedback (zone detection remains a clearly-labeled placeholder)
+- [x] Screen 3: storage - built with the SIMPLIFIED model (pre-roll cache
+      always local; ONE final clip destination: local / Drive sync / Drive
+      API / none). The "local AND Drive" combined destination from
+      UI_SPEC.md is not built and would still need the config model change
+      noted there
+- [x] Screen 4: notifications - plain-language ntfy explainer, App
+      Store/Play Store/web app links, generated topic with copy buttons +
+      QR code for phone scanning, custom topic override, real test-send.
+      (Pushover works in the backend/CLI but has no UI on this screen yet)
 - [ ] Screen 5 (optional toggle, off by default): appearance identification
       - ask the local vision model to describe species/color/etc. as an
-        enrichment of the feeding-event record, not a new event category
-- [ ] This also subsumes the earlier "event history/clip review" dashboard
-      idea (previously listed here as v0.5's "web dashboard") - one UI
-      covers both setup and reviewing past events, rather than two
-      separate things
+        enrichment of the feeding-event record, not a new event category.
+        (Screen exists as a labeled PLACEHOLDER: it saves a pet description
+        to config, but detection.py does not use it yet)
+- [x] This also subsumes the earlier "event history/clip review" dashboard
+      idea (previously listed here as v0.5's "web dashboard") - shipped as
+      the dashboard clip gallery above
 - [ ] Optional `nomwatch ui --expose` flag to auto-wire the UI over
       `tailscale serve` the same clean way `bridge.py` already does for the
       HLS stream - today exposing the UI remotely requires a manual

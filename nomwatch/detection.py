@@ -139,16 +139,18 @@ def pick_vision_model(models: List[str]) -> Optional[str]:
 
 # --- Frame capture via ffmpeg -----------------------------------------------
 
-def capture_frame(stream_url: str, timeout: int = 10) -> Optional[bytes]:
+def capture_frame_with_error(stream_url: str, timeout: int = 10) -> tuple[Optional[bytes], Optional[str]]:
     """
     Grabs a single JPEG frame from an RTSP/HLS stream using ffmpeg.
-    Returns raw JPEG bytes, or None if capture failed (e.g. ffmpeg not
-    installed, or the stream is unreachable).
+    Returns (jpeg_bytes, None) on success, or (None, error_text) on failure -
+    error_text is ffmpeg's own stderr tail (with any credential-bearing URL
+    redacted) so callers can tell apart "wrong password" from "host
+    unreachable" instead of showing one generic failure message.
     """
     with tempfile.TemporaryDirectory() as tmp:
         out_path = Path(tmp) / "frame.jpg"
         try:
-            subprocess.run(
+            proc = subprocess.run(
                 [
                     "ffmpeg", "-y",
                     "-rtsp_transport", "tcp",
@@ -159,14 +161,30 @@ def capture_frame(stream_url: str, timeout: int = 10) -> Optional[bytes]:
                 ],
                 capture_output=True,
                 timeout=timeout,
-                check=True,
             )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
-            return None
+        except subprocess.TimeoutExpired:
+            return None, "timeout: no response from the camera within {}s".format(timeout)
+        except FileNotFoundError:
+            return None, "ffmpeg is not installed"
 
-        if not out_path.exists():
-            return None
-        return out_path.read_bytes()
+        if proc.returncode != 0 or not out_path.exists():
+            stderr = (proc.stderr or b"").decode("utf-8", errors="replace")
+            # Redact the rtsp://user:pass@ URL ffmpeg echoes back in errors.
+            redacted = "\n".join(
+                line for line in stderr.splitlines()[-6:]
+            ).replace(stream_url, "rtsp://<redacted>")
+            return None, redacted or f"ffmpeg exited with code {proc.returncode}"
+        return out_path.read_bytes(), None
+
+
+def capture_frame(stream_url: str, timeout: int = 10) -> Optional[bytes]:
+    """
+    Grabs a single JPEG frame from an RTSP/HLS stream using ffmpeg.
+    Returns raw JPEG bytes, or None if capture failed (e.g. ffmpeg not
+    installed, or the stream is unreachable).
+    """
+    frame, _ = capture_frame_with_error(stream_url, timeout=timeout)
+    return frame
 
 
 # --- Ollama vision detector --------------------------------------------------
@@ -273,7 +291,13 @@ class OllamaVisionDetector(DetectionEngine):
             pass
         return is_feeding, confidence, reason
 
-    def poll_stream(self, stream_url: str, interval_seconds: int = 10, consecutive_required: int = 2):
+    def poll_stream(
+        self,
+        stream_url: str,
+        interval_seconds: int = 10,
+        consecutive_required: int = 2,
+        on_poll=None,
+    ):
         """
         Generator: captures a frame every `interval_seconds` and yields a
         FeedingEvent only once `consecutive_required` polls IN A ROW have all
@@ -288,6 +312,11 @@ class OllamaVisionDetector(DetectionEngine):
         Only one event is yielded per continuous feeding streak (it won't
         re-fire every poll while the pet keeps eating) - the streak resets
         once a poll comes back negative.
+
+        `on_poll`, if given, is called after EVERY cycle with a status dict
+        (ok / is_feeding / confidence / reason / streak / error) - this is
+        the loop's heartbeat, letting a dashboard answer "is this thing
+        actually alive and what did it last see" without tailing a log file.
         """
         streak = 0
         already_fired = False
@@ -295,25 +324,44 @@ class OllamaVisionDetector(DetectionEngine):
         best_reason = ""
 
         while True:
+            status = {"ok": False, "is_feeding": False, "confidence": None, "reason": None, "error": None}
             frame = capture_frame(stream_url)
-            if frame is not None:
+            if frame is None:
+                status["error"] = "frame capture failed (camera unreachable, or ffmpeg problem)"
+            else:
                 result = self.classify(frame)
-                if result and result.is_feeding and result.confidence >= self.min_confidence:
-                    streak += 1
-                    best_confidence = max(best_confidence, result.confidence)
-                    best_reason = result.reason
-                    if streak >= consecutive_required and not already_fired:
-                        already_fired = True
-                        yield FeedingEvent(
-                            timestamp=time.time(),
-                            confidence=best_confidence,
-                            reasoning=best_reason,
-                        )
+                if result is None:
+                    status["error"] = "vision model unreachable (is Ollama still running?)"
                 else:
-                    streak = 0
-                    already_fired = False
-                    best_confidence = 0.0
-                    best_reason = ""
+                    status.update(
+                        ok=True,
+                        is_feeding=result.is_feeding,
+                        confidence=result.confidence,
+                        reason=result.reason,
+                    )
+                    if result.is_feeding and result.confidence >= self.min_confidence:
+                        streak += 1
+                        best_confidence = max(best_confidence, result.confidence)
+                        best_reason = result.reason
+                        if streak >= consecutive_required and not already_fired:
+                            already_fired = True
+                            if on_poll:
+                                on_poll({**status, "streak": streak})
+                            yield FeedingEvent(
+                                timestamp=time.time(),
+                                confidence=best_confidence,
+                                reasoning=best_reason,
+                            )
+                            # skip the duplicate on_poll below for this cycle
+                            time.sleep(interval_seconds)
+                            continue
+                    else:
+                        streak = 0
+                        already_fired = False
+                        best_confidence = 0.0
+                        best_reason = ""
+            if on_poll:
+                on_poll({**status, "streak": streak})
             time.sleep(interval_seconds)
 
 

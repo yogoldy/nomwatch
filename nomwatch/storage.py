@@ -35,7 +35,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import List, Optional
 
-from .config import CONFIG_DIR, StorageConfig
+from .config import CONFIG_DIR, StorageConfig, clean_user_path
 
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]  # least-privilege: only files this app creates
 
@@ -51,7 +51,16 @@ class LocalBackend(StorageBackend):
     """Just copies the clip to a local folder. No cloud, no accounts, no setup."""
 
     def __init__(self, save_dir: Optional[str] = None):
-        self.save_dir = Path(save_dir or (CONFIG_DIR / "clips"))
+        # clean_user_path strips quotes and expands ~/$VARS. A relative
+        # result would silently resolve against the daemon's CWD (observed
+        # live: a quoted absolute path became relative and clips landed in
+        # a literal `'` directory inside the source repo) - refuse it.
+        cleaned = clean_user_path(save_dir)
+        if cleaned and not Path(cleaned).is_absolute():
+            raise ValueError(
+                f"storage.local_save_dir must be an absolute path, got: {save_dir!r}"
+            )
+        self.save_dir = Path(cleaned) if cleaned else (CONFIG_DIR / "clips")
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
     def upload_clip(self, clip_path: Path) -> str:
@@ -109,7 +118,8 @@ class GoogleDriveDesktopSyncBackend(StorageBackend):
     """
 
     def __init__(self, sync_folder: Optional[str] = None, subfolder: str = "NomWatch"):
-        base = Path(sync_folder) if sync_folder else find_google_drive_sync_folder()
+        cleaned = clean_user_path(sync_folder)
+        base = Path(cleaned) if cleaned else find_google_drive_sync_folder()
         if base is None:
             raise FileNotFoundError(
                 "Could not find a Google Drive for Desktop sync folder. Install/sign into "

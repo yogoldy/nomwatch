@@ -28,3 +28,8 @@ token.json
 
 # Claude Code local skill config (personal tooling, not part of the project)
 .claude/
+.nomwatch-run.log
+
+# MediaMTX drops auto-generated TLS certs into its CWD; NomWatch now pins
+# that to ~/.config/nomwatch, but this keeps older versions from polluting the repo
+auto.crt

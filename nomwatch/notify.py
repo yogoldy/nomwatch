@@ -22,12 +22,19 @@ class NtfyNotifier(Notifier):
         self.url = f"{server.rstrip('/')}/{topic}"
 
     def send(self, title: str, message: str) -> bool:
-        resp = requests.post(
-            self.url,
-            data=message.encode("utf-8"),
-            headers={"Title": title},
-            timeout=10,
-        )
+        # A transient network failure here must NOT raise: send() is called
+        # from the long-running monitoring loop, and an uncaught
+        # requests.ConnectionError would kill the whole loop over one
+        # missed push.
+        try:
+            resp = requests.post(
+                self.url,
+                data=message.encode("utf-8"),
+                headers={"Title": title},
+                timeout=10,
+            )
+        except requests.RequestException:
+            return False
         return resp.ok
 
 
@@ -37,16 +44,19 @@ class PushoverNotifier(Notifier):
         self.app_token = app_token
 
     def send(self, title: str, message: str) -> bool:
-        resp = requests.post(
-            "https://api.pushover.net/1/messages.json",
-            data={
-                "token": self.app_token,
-                "user": self.user_key,
-                "title": title,
-                "message": message,
-            },
-            timeout=10,
-        )
+        try:
+            resp = requests.post(
+                "https://api.pushover.net/1/messages.json",
+                data={
+                    "token": self.app_token,
+                    "user": self.user_key,
+                    "title": title,
+                    "message": message,
+                },
+                timeout=10,
+            )
+        except requests.RequestException:
+            return False
         return resp.ok
 
 
