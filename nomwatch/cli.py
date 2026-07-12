@@ -16,11 +16,14 @@ from .config import (
     save_config,
 )
 from .detection import (
+    DEFAULT_VISION_MODEL,
     OllamaVisionDetector,
     capture_frame,
     list_local_models,
+    model_installed,
     pick_vision_model,
     probe_local_model_server,
+    pull_model,
 )
 
 
@@ -41,25 +44,74 @@ def setup():
     stream_path = click.prompt("Stream path", default="stream1")
 
     detection_cfg = DetectionConfig()
+
+    detection_cfg.poll_interval_seconds = click.prompt(
+        "How often should the camera be checked, in seconds?",
+        default=detection_cfg.poll_interval_seconds,
+        type=int,
+    )
+    detection_cfg.required_eating_seconds = click.prompt(
+        "How many seconds of continuous eating behavior before you want a notification? "
+        "(higher = fewer false alerts, more delay)",
+        default=detection_cfg.required_eating_seconds,
+        type=int,
+    )
+    detection_cfg.consecutive_required = max(
+        1, round(detection_cfg.required_eating_seconds / detection_cfg.poll_interval_seconds)
+    )
+    click.echo(
+        f"-> Will require {detection_cfg.consecutive_required} consecutive positive checks "
+        f"in a row (~{detection_cfg.consecutive_required * detection_cfg.poll_interval_seconds}s) "
+        "before notifying."
+    )
+
+    click.echo("\nChecking for a local detection model (Ollama)...")
     if probe_local_model_server(detection_cfg.ollama_host):
         models = list_local_models(detection_cfg.ollama_host)
         vision_model = pick_vision_model(models)
+
         if vision_model:
-            click.echo(f"\nFound local Ollama server with vision-capable model: {vision_model}")
+            click.echo(f"Found local Ollama server with vision-capable model: {vision_model}")
             detection_cfg.engine = "ollama"
             detection_cfg.ollama_model = vision_model
+
         else:
             click.echo(
-                f"\nFound local Ollama server, but none of its models ({', '.join(models) or 'none'}) "
-                "look vision-capable. Install one (e.g. `ollama pull gemma3:4b`) to use it here, "
-                "or NomWatch will fall back to a bundled detector once that lands."
+                f"Found local Ollama server, but none of its installed models "
+                f"({', '.join(models) or 'none'}) look vision-capable."
             )
-            detection_cfg.engine = "motion"
+            if click.confirm(
+                f"Install the recommended vision model ({DEFAULT_VISION_MODEL}) now via "
+                "`ollama pull`?", default=True
+            ):
+                click.echo(f"Pulling {DEFAULT_VISION_MODEL} - this can take a few minutes...\n")
+                pulled_ok = pull_model(DEFAULT_VISION_MODEL, on_output=click.echo)
+
+                # Verify it's actually there, don't just trust the exit code.
+                models_after = list_local_models(detection_cfg.ollama_host)
+                if pulled_ok and model_installed(models_after, DEFAULT_VISION_MODEL):
+                    click.echo(f"\n✅ Verified: {DEFAULT_VISION_MODEL} is installed and ready.")
+                    detection_cfg.engine = "ollama"
+                    detection_cfg.ollama_model = DEFAULT_VISION_MODEL
+                else:
+                    click.echo(
+                        f"\n⚠️  Could not verify {DEFAULT_VISION_MODEL} is installed after the pull. "
+                        f"Try `ollama pull {DEFAULT_VISION_MODEL}` manually, then rerun `nomwatch setup`."
+                    )
+                    detection_cfg.engine = "motion"
+            else:
+                click.echo(
+                    f"Skipping install. Run `ollama pull {DEFAULT_VISION_MODEL}` manually "
+                    "and rerun `nomwatch setup` whenever you're ready."
+                )
+                detection_cfg.engine = "motion"
+
     else:
         click.echo(
-            "\nNo local Ollama server detected on "
-            f"{detection_cfg.ollama_host} - NomWatch will fall back to its "
-            "bundled/motion detector once that integration lands."
+            f"No local Ollama server detected on {detection_cfg.ollama_host}. "
+            "Install and start Ollama first (https://ollama.com/download), then rerun "
+            "`nomwatch setup` - NomWatch will fall back to its bundled/motion detector "
+            "until then."
         )
         detection_cfg.engine = "motion"
 
@@ -155,11 +207,16 @@ def detect_test():
         host=cfg.detection.ollama_host,
         min_confidence=cfg.detection.min_confidence,
     )
-    event = detector.check_frame(frame)
-    if event:
-        click.echo(f"✅ Feeding event detected (confidence {event.confidence:.2f}): {event.reasoning}")
+    result = detector.classify(frame)
+    if result is None:
+        click.echo("Could not reach the Ollama server to classify this frame.")
+        return
+
+    if result.is_feeding and result.confidence >= cfg.detection.min_confidence:
+        click.echo(f"✅ FEEDING event (confidence {result.confidence:.2f}): {result.reason}")
     else:
-        click.echo("No feeding event detected in this frame (or confidence below threshold).")
+        verdict = "feeding, but below confidence threshold" if result.is_feeding else "not feeding"
+        click.echo(f"❌ No feeding event ({verdict}, confidence {result.confidence:.2f}): {result.reason}")
 
 
 @main.command()

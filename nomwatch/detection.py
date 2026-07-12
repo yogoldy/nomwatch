@@ -27,6 +27,8 @@ from typing import List, Optional
 
 import requests
 
+DEFAULT_VISION_MODEL = "gemma3:4b"
+
 # Name substrings of Ollama models known to support image input.
 # Matched case-insensitively against whatever's in `ollama list`.
 VISION_MODEL_HINTS = [
@@ -40,6 +42,14 @@ VISION_MODEL_HINTS = [
     "llama3.2-vision",
     "pixtral",
 ]
+
+
+@dataclass
+class ClassificationResult:
+    is_feeding: bool
+    confidence: float
+    reason: str
+    raw_text: str
 
 
 @dataclass
@@ -78,6 +88,39 @@ def probe_local_model_server(host: str = "http://localhost:11434") -> bool:
         return resp.status_code == 200
     except requests.RequestException:
         return False
+
+
+def model_installed(models: List[str], model_name: str) -> bool:
+    """Exact-match check (case-insensitive) that a given model tag is in the installed list."""
+    lowered = {m.lower() for m in models if m}
+    return model_name.lower() in lowered
+
+
+def pull_model(model_name: str = DEFAULT_VISION_MODEL, on_output=None) -> bool:
+    """
+    Runs `ollama pull <model_name>`, streaming output line-by-line to `on_output`
+    (if given, e.g. click.echo) so the user sees real download progress.
+    Returns True if the pull succeeded (exit code 0), False otherwise
+    (e.g. `ollama` binary not installed/running, network failure, bad tag).
+    """
+    try:
+        process = subprocess.Popen(
+            ["ollama", "pull", model_name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+    except FileNotFoundError:
+        if on_output:
+            on_output("The `ollama` command wasn't found - install Ollama first: https://ollama.com/download")
+        return False
+
+    for line in process.stdout:
+        if on_output:
+            on_output(line.rstrip())
+    process.wait()
+    return process.returncode == 0
 
 
 def pick_vision_model(models: List[str]) -> Optional[str]:
@@ -154,7 +197,14 @@ class OllamaVisionDetector(DetectionEngine):
         self.host = host
         self.min_confidence = min_confidence
 
-    def check_frame(self, frame_bytes: bytes) -> Optional[FeedingEvent]:
+    def classify(self, frame_bytes: bytes) -> Optional["ClassificationResult"]:
+        """
+        Runs the model on a frame and returns the full raw judgment
+        (is_feeding, confidence, reason, raw response text) regardless of
+        whether it clears min_confidence. Use this when you want to inspect
+        or log borderline/negative calls, not just act on positives.
+        Returns None only on a request failure (model unreachable, etc.).
+        """
         b64 = base64.b64encode(frame_bytes).decode("ascii")
         try:
             resp = requests.post(
@@ -173,16 +223,29 @@ class OllamaVisionDetector(DetectionEngine):
 
         text = resp.json().get("response", "")
         is_feeding, confidence, reason = self._parse(text)
-        if is_feeding and confidence >= self.min_confidence:
+        return ClassificationResult(
+            is_feeding=is_feeding, confidence=confidence, reason=reason, raw_text=text
+        )
+
+    def check_frame(self, frame_bytes: bytes) -> Optional[FeedingEvent]:
+        result = self.classify(frame_bytes)
+        if result and result.is_feeding and result.confidence >= self.min_confidence:
             return FeedingEvent(
                 timestamp=time.time(),
-                confidence=confidence,
-                reasoning=reason,
+                confidence=result.confidence,
+                reasoning=result.reason,
             )
         return None
 
     @staticmethod
     def _parse(text: str) -> tuple[bool, float, str]:
+        """
+        Parses the model's "FEEDING: yes|no CONFIDENCE: 0.0-1.0 REASON: ..."
+        response. Tolerant of the model dropping the REASON: label entirely
+        (observed in practice) and of extra colons inside the reason text
+        itself (fixed: previously used a colon-count split that mangled
+        reasoning on the standard 3-colon response format).
+        """
         is_feeding = False
         confidence = 0.0
         reason = text.strip()
@@ -193,24 +256,64 @@ class OllamaVisionDetector(DetectionEngine):
                 after = lower.split("confidence:", 1)[1].strip()
                 num = after.split()[0].rstrip(".,")
                 confidence = float(num)
-            if "reason:" in lower:
-                reason = text.split(":", 2)[-1].strip() if "reason:" in lower else reason
+
+            reason_idx = lower.find("reason:")
+            if reason_idx != -1:
+                # Slice the ORIGINAL text (preserves casing) right after the
+                # "reason:" label, regardless of how many colons came before it.
+                reason = text[reason_idx + len("reason:"):].strip()
+            elif "confidence:" in lower:
+                # Model dropped the REASON: label but still gave one after
+                # the confidence number - grab whatever trails the number.
+                after_conf = text[lower.find("confidence:") + len("confidence:"):].strip()
+                parts = after_conf.split(None, 1)
+                if len(parts) == 2:
+                    reason = parts[1].strip()
         except (ValueError, IndexError):
             pass
         return is_feeding, confidence, reason
 
-    def poll_stream(self, stream_url: str, interval_seconds: int = 15):
+    def poll_stream(self, stream_url: str, interval_seconds: int = 10, consecutive_required: int = 2):
         """
-        Generator: captures a frame every `interval_seconds` and yields
-        FeedingEvents as they're detected. Runs indefinitely - caller decides
-        how to consume it (e.g. wire to notify.py / storage.py).
+        Generator: captures a frame every `interval_seconds` and yields a
+        FeedingEvent only once `consecutive_required` polls IN A ROW have all
+        independently judged "feeding" above min_confidence. Runs indefinitely -
+        caller decides how to consume it (e.g. wire to notify.py / storage.py).
+
+        This debounce exists because a single frame can be wrongly classified
+        with real confidence (observed in practice: the model confidently
+        misreading an atypical camera angle) - requiring several agreeing
+        polls in a row, spanning real wall-clock seconds of actual behavior,
+        makes a single bad frame far less likely to trigger a false alert.
+        Only one event is yielded per continuous feeding streak (it won't
+        re-fire every poll while the pet keeps eating) - the streak resets
+        once a poll comes back negative.
         """
+        streak = 0
+        already_fired = False
+        best_confidence = 0.0
+        best_reason = ""
+
         while True:
             frame = capture_frame(stream_url)
             if frame is not None:
-                event = self.check_frame(frame)
-                if event is not None:
-                    yield event
+                result = self.classify(frame)
+                if result and result.is_feeding and result.confidence >= self.min_confidence:
+                    streak += 1
+                    best_confidence = max(best_confidence, result.confidence)
+                    best_reason = result.reason
+                    if streak >= consecutive_required and not already_fired:
+                        already_fired = True
+                        yield FeedingEvent(
+                            timestamp=time.time(),
+                            confidence=best_confidence,
+                            reasoning=best_reason,
+                        )
+                else:
+                    streak = 0
+                    already_fired = False
+                    best_confidence = 0.0
+                    best_reason = ""
             time.sleep(interval_seconds)
 
 

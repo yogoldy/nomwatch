@@ -39,8 +39,14 @@ class DetectionConfig:
     engine: str = "ollama"  # "ollama" | "frigate" | "yolo" | "motion"
     ollama_host: str = "http://localhost:11434"
     ollama_model: Optional[str] = None  # auto-picked at setup time if None
-    poll_interval_seconds: int = 15
+    poll_interval_seconds: int = 10
     min_confidence: float = 0.6
+    # How many consecutive "yes" polls in a row are required before a
+    # notification actually fires - derived from required_eating_seconds
+    # at setup time (e.g. 20s of continuous eating / 10s poll = 2 in a row).
+    # Guards against a single hallucinated/ambiguous frame firing a false alert.
+    consecutive_required: int = 2
+    required_eating_seconds: int = 20
 
 
 @dataclass
