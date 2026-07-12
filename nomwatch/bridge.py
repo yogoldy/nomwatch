@@ -35,10 +35,17 @@ paths:
 
 RECORDING_BLOCK_TEMPLATE = """\
     record: yes
-    recordPath: {recordings_dir}/%path/%Y-%m-%d_%H-%M-%S-%f.mp4
+    recordPath: {recordings_dir}/%path/%Y-%m-%d_%H-%M-%S-%f
     recordSegmentDuration: {segment_seconds}s
     recordDeleteAfter: {retention_seconds}s
 """
+# NOTE: recordPath deliberately has NO trailing extension. MediaMTX appends
+# its own extension based on recordFormat (default "fmp4" -> ".mp4") - a
+# hardcoded ".mp4" here produces "....mp4.mp4" filenames, which breaks
+# clip.py's SEGMENT_FILENAME_RE and makes find_segments_covering() silently
+# return [] for every real segment (100% pre-roll clip failure). Found via
+# a real live test against actual MediaMTX output - a hand-named synthetic
+# test file wouldn't have caught this.
 
 
 def render_mediamtx_config(cfg: NomWatchConfig) -> str:
