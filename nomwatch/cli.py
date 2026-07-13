@@ -7,6 +7,7 @@ import datetime
 import json
 import os
 import platform
+import shutil
 import time
 from pathlib import Path
 
@@ -683,6 +684,201 @@ def ui(port: int):
 
     click.echo(f"Starting NomWatch UI at http://127.0.0.1:{port} (Ctrl+C to stop)")
     run_ui(port=port)
+
+
+def _path_stats(path: Path) -> tuple[int, int]:
+    """Returns (file_count, total_bytes) for a file or directory tree."""
+    if path.is_file():
+        try:
+            return 1, path.stat().st_size
+        except OSError:
+            return 1, 0
+    files = 0
+    size = 0
+    for p in path.rglob("*"):
+        if p.is_file():
+            files += 1
+            try:
+                size += p.stat().st_size
+            except OSError:
+                pass
+    return files, size
+
+
+def _human_size(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}GB"
+
+
+def prune_targets(include_saved: bool):
+    """The set of prunable event-data paths that currently exist."""
+    targets = []  # (label, Path)
+    candidates = [
+        ("event log (events.jsonl)", CONFIG_DIR / "events.jsonl"),
+        ("clips", CONFIG_DIR / "clips"),
+        ("thumbnails", CONFIG_DIR / "thumbnails"),
+        ("diagnostic log (classifications.jsonl)", CONFIG_DIR / "classifications.jsonl"),
+        ("flagged frames", CONFIG_DIR / "flagged_frames"),
+    ]
+    if include_saved:
+        from .config import clean_user_path
+        cfg = load_config()
+        if cfg and cfg.storage.local_save_dir:
+            sd = clean_user_path(cfg.storage.local_save_dir)
+            if sd:
+                candidates.append(("external saved clips", Path(sd)))
+    for label, p in candidates:
+        if p.exists():
+            targets.append((label, p))
+    return targets
+
+
+@main.command()
+@click.option("--delete", "hard_delete", is_flag=True,
+              help="PERMANENTLY delete instead of archiving to a recoverable folder.")
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation prompt.")
+@click.option("--include-saved", is_flag=True,
+              help="Also clear the external clip folder (storage.local_save_dir), not just NomWatch's internal data.")
+def prune(hard_delete: bool, yes: bool, include_saved: bool):
+    """Clear event history, clips, thumbnails and diagnostic logs.
+
+    Useful after a bad tuning run (e.g. a batch of false positives). By default
+    everything is MOVED into a timestamped archive folder under the config dir
+    so it's recoverable; pass --delete to permanently remove it instead.
+    """
+    targets = prune_targets(include_saved)
+    if not targets:
+        click.echo("Nothing to prune - already clean.")
+        return
+
+    total_files = total_bytes = 0
+    click.echo("Will clear:")
+    for label, p in targets:
+        files, size = _path_stats(p)
+        total_files += files
+        total_bytes += size
+        click.echo(f"  - {label}: {files} file(s), {_human_size(size)}")
+    action = "permanently delete" if hard_delete else "archive"
+    click.echo(f"Total: {total_files} file(s), {_human_size(total_bytes)} to {action}.")
+
+    if not yes and not click.confirm(
+        f"{'PERMANENTLY DELETE' if hard_delete else 'Archive'} these now?", default=False
+    ):
+        click.echo("Aborted.")
+        return
+
+    archive_dir = None
+    if not hard_delete:
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        archive_dir = CONFIG_DIR / "archive" / f"prune-{stamp}"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+
+    for label, p in targets:
+        if hard_delete:
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                p.unlink(missing_ok=True)
+        else:
+            shutil.move(str(p), str(archive_dir / p.name))
+
+    if hard_delete:
+        click.echo(f"✅ Permanently deleted {total_files} file(s), freed {_human_size(total_bytes)}.")
+    else:
+        click.echo(f"✅ Archived {total_files} file(s) ({_human_size(total_bytes)}) to {archive_dir}")
+        click.echo(f"   Recover with: mv {archive_dir}/* {CONFIG_DIR}/")
+        click.echo(f"   Permanently delete later with: rm -rf '{archive_dir}'")
+
+
+@main.command()
+@click.option("--frames", "-n", default=15, help="How many frames to sample.")
+@click.option("--interval", default=2.0, help="Seconds between frames.")
+def calibrate(frames: int, interval: float):
+    """Measure this camera's baseline false-positive rate on an EMPTY scene.
+
+    Point the camera at the feeder with NO pet present, then run this. It
+    samples several frames, checks how often the vision model wrongly says
+    "feeding" and how much the scene drifts frame-to-frame, and suggests
+    threshold settings tuned to THIS camera/lighting.
+    """
+    cfg = load_config()
+    if cfg is None:
+        click.echo("No config found. Run `nomwatch setup` first.")
+        return
+
+    stream_url = rtsp_url(cfg)
+    zone = Zone.from_config(cfg.detection)
+    detector = None
+    if cfg.detection.ollama_model:
+        detector = OllamaVisionDetector(
+            model=cfg.detection.ollama_model,
+            host=cfg.detection.ollama_host,
+            min_confidence=cfg.detection.min_confidence,
+            pet_description=cfg.detection.pet_description,
+        )
+    motion = FrameDiffMotion(threshold=cfg.detection.motion_threshold)
+
+    click.echo(
+        f"Calibrating on the CURRENT scene (make sure NO pet is present). "
+        f"Sampling {frames} frames, ~{interval}s apart{' (zone-cropped)' if zone else ''}...\n"
+    )
+    prev_thumb = None
+    motion_scores = []
+    vision_total = 0
+    vision_yes = 0
+    fp_confidences = []
+    for i in range(frames):
+        frame = capture_frame(stream_url)
+        if frame is None:
+            click.echo(f"  frame {i+1}/{frames}: capture failed")
+            time.sleep(interval)
+            continue
+        analysed = crop_to_zone(frame, zone) if zone is not None else frame
+        thumb = motion.thumbnail(analysed)
+        if prev_thumb is not None and thumb is not None:
+            motion_scores.append(motion.compare(prev_thumb, thumb).score)
+        if thumb is not None:
+            prev_thumb = thumb
+        line = f"  frame {i+1}/{frames}:"
+        if detector is not None:
+            res = detector.classify(analysed)
+            if res is not None:
+                vision_total += 1
+                if res.is_feeding:
+                    vision_yes += 1
+                    fp_confidences.append(res.confidence)
+                line += f" model says {'FEEDING' if res.is_feeding else 'no'} ({res.confidence:.2f})"
+        if motion_scores:
+            line += f"  motion={motion_scores[-1]:.2f}"
+        click.echo(line)
+        time.sleep(interval)
+
+    click.echo("\n--- Results (empty scene, so any 'FEEDING' is a false positive) ---")
+    noise_max = max(motion_scores) if motion_scores else 0.0
+    noise_avg = sum(motion_scores) / len(motion_scores) if motion_scores else 0.0
+    click.echo(f"Motion on a still scene: avg {noise_avg:.2f}, max {noise_max:.2f} (this is your noise floor).")
+    suggested_threshold = max(1.0, round(noise_max * 4, 1))
+    click.echo(f"-> Suggested motion_threshold: {suggested_threshold} (≈4x the noise floor; currently {cfg.detection.motion_threshold}).")
+
+    if detector is None:
+        click.echo("No vision model configured, so only motion was measured.")
+    elif vision_total == 0:
+        click.echo("Could not reach the vision model to measure its false-positive rate.")
+    elif vision_yes == 0:
+        click.echo(f"Vision model: 0/{vision_total} frames wrongly called feeding - reliable on this scene. 👍")
+    else:
+        rate = 100 * vision_yes / vision_total
+        worst = max(fp_confidences)
+        click.echo(f"⚠️  Vision model wrongly called feeding on {vision_yes}/{vision_total} frames ({rate:.0f}%), "
+                   f"confidence up to {worst:.2f}.")
+        click.echo("-> Recommend engine 'hybrid' or 'ollama' with motion-gating on, so these static-scene "
+                   "false positives never count.")
+        if worst < 0.95:
+            click.echo(f"-> Or raise min_confidence above {worst:.2f} (currently {cfg.detection.min_confidence}).")
+    click.echo("\nThese are suggestions - set them on the dashboard's detection settings, then restart monitoring.")
 
 
 @main.command()

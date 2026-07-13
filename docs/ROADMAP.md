@@ -122,11 +122,33 @@ cat-eating frames still detected**. All items below then built on top:
       on setup screen 2 (over a live camera snapshot); normalized coords saved
       to config and applied via ffmpeg `crop` to BOTH the motion diff and the
       image sent to the model. Verified live in-browser.
-- [ ] Optional, not done this pass: a setup-time calibration step - capture N
-      frames of the actual empty feeder on THIS camera and run real
-      classifications to measure this camera/model's baseline
-      false-positive rate, then suggest a `min_confidence` /
-      `consecutive_required` that would have suppressed it.
+- [x] Setup-time calibration step - shipped as `nomwatch calibrate` in v0.8 below.
+
+## v0.8 — Operational hardening
+Turning the v0.7 open items into finished features, plus two real bugs found
+while doing it. Verified live on 2026-07-12.
+- [x] **`nomwatch prune`** + dashboard "Clear history": clear events, clips,
+      thumbnails, and diagnostic logs after a bad tuning run. Default ARCHIVES
+      to a recoverable `~/.config/nomwatch/archive/<ts>/` folder; `--delete`
+      hard-removes. (The dashboard button only archives; hard-delete is
+      CLI-only on purpose.) Ran it to clear ~180MB of false-positive junk.
+- [x] **`nomwatch calibrate`**: samples N frames of the empty scene, reports
+      the vision model's false-positive rate and the motion noise floor on
+      THIS camera, and suggests `motion_threshold` / `min_confidence`.
+- [x] **Auto-start service, dashboard-managed**: install/uninstall/status of
+      the launchd agent from the dashboard (was CLI-setup-only). Installs stop
+      any manual loop first to avoid a double-notifying duplicate.
+- [x] **Fixed two auto-start bugs found live** (the feature was silently
+      broken on any machine like this one):
+      1. the plist split the executable path on spaces, so a venv under
+         `Documents (local)/` produced an unrunnable `ProgramArguments`
+         (now built as a proper argv list);
+      2. launchd's bare PATH didn't include Homebrew, so the agent couldn't
+         find `ffmpeg`/`mediamtx` and every capture failed silently (now the
+         plist pins a real PATH via `EnvironmentVariables`).
+- [x] **Exposed detection knobs** in the setup UI: `min_confidence` and
+      `motion_threshold` (were config-only), so calibration's suggestions are
+      one edit away.
 
 ## Client/viewer architecture decision
 NomWatch always requires one real host machine (Mac, and eventually

@@ -31,6 +31,7 @@ Known limitations, noted rather than hidden:
 from __future__ import annotations
 
 import base64
+import datetime
 import html
 import json
 import os
@@ -81,6 +82,11 @@ from .detection import (
     pull_model,
 )
 from .notify import NtfyNotifier
+from .service import (
+    install_launchd_service,
+    launchd_service_status,
+    uninstall_launchd_service,
+)
 from .storage import find_google_drive_sync_folder
 
 # --- "Start monitoring right now" process management -----------------------
@@ -615,6 +621,11 @@ PAGE_TEMPLATE = """\
             <input type="number" step="0.5" min="0" id="motion-threshold" value="{motion_threshold}">
         </div>
 
+        <label>Minimum AI confidence to count (0.0&ndash;1.0)
+            <span class="info-icon">i<span class="tooltip">The vision model must be at least this sure before a frame counts as feeding. Higher = fewer false alarms, but may miss borderline real ones. Run `nomwatch calibrate` to get a suggestion for your camera.</span></span>
+        </label>
+        <input type="number" step="0.05" min="0" max="1" id="min-confidence" value="{min_confidence}">
+
         <div style="border:1px solid var(--border, #d0d0d0); border-radius:8px; padding:10px; margin:12px 0;">
             <label style="display:flex; align-items:center; gap:8px; margin:0;">
                 <input type="checkbox" id="zone-enabled" onchange="onZoneToggle()"> Restrict detection to a feeding zone (optional)
@@ -1025,6 +1036,7 @@ PAGE_TEMPLATE = """\
             const engine = document.querySelector('input[name="detection-engine"]:checked').value;
             const motionGating = document.getElementById('motion-gating').checked;
             const motionThreshold = parseFloat(document.getElementById('motion-threshold').value) || 2.0;
+            const minConfidence = parseFloat(document.getElementById('min-confidence').value);
             const zoneEnabled = document.getElementById('zone-enabled').checked && !!zoneNorm;
             const body = {{
                 poll_interval_seconds: poll,
@@ -1034,6 +1046,7 @@ PAGE_TEMPLATE = """\
                 engine: engine,
                 motion_gating: motionGating,
                 motion_threshold: motionThreshold,
+                min_confidence: minConfidence,
                 zone_detection_enabled: zoneEnabled,
             }};
             if (zoneEnabled) {{
@@ -1414,6 +1427,17 @@ DASHBOARD_TEMPLATE = """\
     </div>
 
     <div class="card">
+        <h2>Automatic start-up</h2>
+        <p class="helper-text">
+            Without this, monitoring stops when you reboot or log out and you'd have to come back
+            and press Start. Installing the auto-start service (macOS launchd) makes
+            <code>nomwatch run</code> launch at login and restart itself if it ever crashes.
+        </p>
+        <div id="service-status" class="status-box">Checking...</div>
+        <div id="service-actions"></div>
+    </div>
+
+    <div class="card">
         <h2>Notifications</h2>
         <p class="helper-text">
             Provider: <strong>{notify_provider}</strong>
@@ -1431,6 +1455,15 @@ DASHBOARD_TEMPLATE = """\
             copies already synced to cloud storage).
         </p>
         <div id="events-container"><p class="empty-note">Loading...</p></div>
+        <div style="margin-top:12px; border-top:1px solid var(--border, #e0e0e0); padding-top:10px;">
+            <button class="secondary" type="button" onclick="clearHistory()">Clear history &amp; clips</button>
+            <span class="helper-text" id="clear-history-status"></span>
+            <p class="helper-text">
+                Moves all events, clips, thumbnails and diagnostic logs into a recoverable archive
+                folder (great after a batch of false alarms). To permanently free the disk space,
+                run <code>nomwatch prune --delete</code> in a terminal.
+            </p>
+        </div>
     </div>
 
     <div class="card">
@@ -1564,6 +1597,51 @@ DASHBOARD_TEMPLATE = """\
             document.getElementById('monitor-stale').innerHTML = data.monitoring_stale_config
                 ? '<div class="stale-note">Settings were saved after monitoring started - it is still using the OLD settings. Click "Restart (apply latest settings)" below.</div>'
                 : '';
+
+            // --- Automatic start-up (launchd) ---
+            const svcStatus = document.getElementById('service-status');
+            const svcActions = document.getElementById('service-actions');
+            if (svcStatus && svcActions) {{
+                if (data.service_installed) {{
+                    svcStatus.className = 'status-box ok';
+                    svcStatus.textContent = '✅ Auto-start is installed - monitoring will come back on its own after a reboot.';
+                    svcActions.innerHTML = '<button class="secondary" onclick="uninstallService()">Turn off auto-start</button>';
+                }} else {{
+                    svcStatus.className = 'status-box';
+                    svcStatus.textContent = 'Auto-start is off - monitoring will NOT restart by itself after a reboot.';
+                    svcActions.innerHTML = '<button onclick="installService()">Turn on auto-start</button>';
+                }}
+            }}
+        }}
+
+        async function installService() {{
+            const el = document.getElementById('service-status');
+            el.textContent = 'Installing auto-start service...';
+            const res = await fetch('/api/install-service', {{ method: 'POST' }});
+            const data = await res.json();
+            if (!data.ok) {{ el.className = 'status-box warn'; el.textContent = 'Failed: ' + data.error; return; }}
+            setTimeout(refreshDashboard, 800);
+        }}
+
+        async function uninstallService() {{
+            const el = document.getElementById('service-status');
+            el.textContent = 'Removing auto-start service...';
+            const res = await fetch('/api/uninstall-service', {{ method: 'POST' }});
+            const data = await res.json();
+            if (!data.ok) {{ el.className = 'status-box warn'; el.textContent = 'Failed: ' + data.error; return; }}
+            setTimeout(refreshDashboard, 800);
+        }}
+
+        async function clearHistory() {{
+            if (!confirm('Move all events, clips, thumbnails and diagnostic logs into a recoverable archive folder?')) return;
+            const el = document.getElementById('clear-history-status');
+            el.textContent = ' archiving...';
+            const res = await fetch('/api/prune', {{ method: 'POST' }});
+            const data = await res.json();
+            if (!data.ok) {{ el.textContent = ' failed.'; return; }}
+            const mb = (data.bytes / (1024*1024)).toFixed(1);
+            el.textContent = data.archived ? ` archived ${{data.archived}} file(s), ${{mb}}MB.` : ' nothing to clear.';
+            loadEvents();
         }}
 
         async function installMediaMtx() {{
@@ -1791,6 +1869,8 @@ def create_app():
         run_pid, run_started = read_pid_info(RUN_PID_PATH)
         mtx_pid, mtx_started = read_pid_info(MEDIAMTX_PID_PATH)
         external_pids = _external_run_pids()
+        service_status = launchd_service_status()
+        service_installed = service_status.startswith("Installed")
         heartbeat = _read_heartbeat()
         # A heartbeat is only meaningful while some monitoring process is
         # alive - otherwise it's the corpse of the last run.
@@ -1809,6 +1889,8 @@ def create_app():
             "monitoring_pid": run_pid,
             "monitoring_external_pids": external_pids,
             "monitoring_stale_config": run_pid is not None and _config_changed_since(run_started),
+            "service_installed": service_installed,
+            "service_status_text": service_status,
             "heartbeat": heartbeat,
             "detection_engine": cfg.detection.engine,
             "detection_model": cfg.detection.ollama_model,
@@ -1857,6 +1939,52 @@ def create_app():
     def api_stop_monitoring():
         stopped = _stop_run_loop()
         return jsonify({"ok": stopped})
+
+    @app.route("/api/install-service", methods=["POST"])
+    def api_install_service():
+        # A launchd agent and a UI-started loop would both run `nomwatch run`
+        # and double every notification/clip. Stop the manual loop first so the
+        # service becomes the single owner.
+        _stop_run_loop()
+        error = install_launchd_service(CONFIG_DIR / "logs")
+        if error:
+            return jsonify({"ok": False, "error": error})
+        return jsonify({"ok": True, "error": None})
+
+    @app.route("/api/uninstall-service", methods=["POST"])
+    def api_uninstall_service():
+        error = uninstall_launchd_service()
+        # "No service found" is a success from the user's point of view.
+        if error and "No NomWatch launchd service" not in error:
+            return jsonify({"ok": False, "error": error})
+        return jsonify({"ok": True, "error": None})
+
+    @app.route("/api/prune", methods=["POST"])
+    def api_prune():
+        """Clear event history/clips/logs. Always ARCHIVES (moves to a
+        recoverable folder) from the UI - the irreversible hard-delete is
+        intentionally CLI-only (`nomwatch prune --delete`)."""
+        from .cli import prune_targets, _path_stats
+
+        targets = prune_targets(include_saved=False)
+        if not targets:
+            return jsonify({"ok": True, "archived": 0, "bytes": 0, "archive_dir": None})
+        total_files = total_bytes = 0
+        for _label, p in targets:
+            f, b = _path_stats(p)
+            total_files += f
+            total_bytes += b
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        archive_dir = CONFIG_DIR / "archive" / f"prune-{stamp}"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        for _label, p in targets:
+            shutil.move(str(p), str(archive_dir / p.name))
+        return jsonify({
+            "ok": True,
+            "archived": total_files,
+            "bytes": total_bytes,
+            "archive_dir": str(archive_dir),
+        })
 
     @app.route("/api/recent-events")
     def api_recent_events():
@@ -1971,6 +2099,7 @@ def create_app():
             detection_engine=det.engine,
             motion_gating_js=("true" if det.motion_gating else "false"),
             motion_threshold=det.motion_threshold,
+            min_confidence=det.min_confidence,
             zone_enabled_js=("true" if det.zone_detection_enabled else "false"),
             zone_js=zone_js,
         )
@@ -2171,6 +2300,12 @@ def create_app():
             mt = float(data.get("motion_threshold", cfg.detection.motion_threshold))
             if mt > 0:
                 cfg.detection.motion_threshold = mt
+        except (TypeError, ValueError):
+            pass
+        try:
+            mc = float(data.get("min_confidence", cfg.detection.min_confidence))
+            if 0.0 <= mc <= 1.0:
+                cfg.detection.min_confidence = mc
         except (TypeError, ValueError):
             pass
 
