@@ -61,7 +61,7 @@ class BridgeConfig:
 
 @dataclass
 class DetectionConfig:
-    engine: str = "ollama"  # "ollama" | "frigate" | "yolo" | "motion"
+    engine: str = "ollama"  # "ollama" | "motion" | "hybrid" | "frigate" | "yolo"
     ollama_host: str = "http://localhost:11434"
     ollama_model: Optional[str] = None  # auto-picked at setup time if None
     poll_interval_seconds: int = 10
@@ -89,9 +89,25 @@ class DetectionConfig:
     # prompt in detection.py. Stored so the UI has somewhere real to save
     # it once that wiring is built.
     pet_description: Optional[str] = None
-    # Placeholder only - no architecture exists for this yet. Recorded here
-    # so the config shape is ready whenever it's actually built.
+    # Motion detection (frame-diff, ffmpeg-based - see detection.FrameDiffMotion).
+    # motion_gating: when the engine is "ollama", skip the vision model entirely
+    # on a frame with no motion since the last one (a static bowl-with-food
+    # never reaches the LLM). Always effectively on for "hybrid". Ignored for
+    # the standalone "motion" engine. motion_threshold is the mean-absolute-diff
+    # (0-255) above which a frame counts as "moved" - measured noise floor on
+    # the real camera is ~0.3, a moving cat ~20-48, so 2.0 has a wide margin.
+    motion_gating: bool = True
+    motion_threshold: float = 2.0
+    # Zone cropping: restrict BOTH the motion diff and the image sent to the
+    # vision model to just the feeder/bowl area. Coordinates are normalized
+    # fractions of the frame (0.0-1.0): (zone_x, zone_y) is the top-left corner,
+    # (zone_w, zone_h) the width/height. Only applied when zone_detection_enabled
+    # is true and all four coordinates are set.
     zone_detection_enabled: bool = False
+    zone_x: Optional[float] = None
+    zone_y: Optional[float] = None
+    zone_w: Optional[float] = None
+    zone_h: Optional[float] = None
 
 
 @dataclass

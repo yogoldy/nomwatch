@@ -24,8 +24,6 @@ Known limitations, noted rather than hidden:
   this is a minor concern, not a secrets leak - but it's an external network
   call worth knowing about. A self-hosted/client-side QR generator would
   remove this dependency; not built yet.
-- Zone/bounding-box detection (screen 2) is a PLACEHOLDER ONLY. No
-  architecture exists for it yet - see docs/ROADMAP.md.
 - No host-vs-client/multi-device delegation concept exists anywhere in
   NomWatch yet - whichever machine runs `nomwatch run`/`nomwatch ui` is
   simply "the bridge" by virtue of running it there.
@@ -596,15 +594,42 @@ PAGE_TEMPLATE = """\
 
         <div id="model-status" class="status-box">Checking for a local model server...</div>
 
-        <div class="placeholder">
-            <span class="placeholder-badge">PLACEHOLDER &mdash; NOT IMPLEMENTED</span>
-            <h3 style="margin:6px 0;">Zone-based detection (bounding boxes)</h3>
-            <p style="margin:4px 0;">
-                Draw a box around just the feeder area so detection ignores everything else in frame.
-                No architecture exists for this yet &mdash; this is a placeholder to show where it will
-                eventually live. Currently NomWatch always evaluates the full frame.
-            </p>
-            <button class="secondary" disabled>Draw zone (coming later)</button>
+        <label>Detection engine
+            <span class="info-icon">i<span class="tooltip">How NomWatch decides feeding is happening. Motion-gated vision is recommended; hybrid is strictest; motion-only needs no AI model.</span></span>
+        </label>
+        <div class="radio-group" id="engine-group">
+            <label><input type="radio" name="detection-engine" value="ollama"> Vision model (AI) &mdash; recommended</label>
+            <label><input type="radio" name="detection-engine" value="hybrid"> Hybrid: motion AND the AI must agree (strictest, fewest false alarms)</label>
+            <label><input type="radio" name="detection-engine" value="motion"> Motion only (no AI model at all)</label>
+        </div>
+
+        <label id="motion-gating-row" style="display:flex; align-items:center; gap:8px;">
+            <input type="checkbox" id="motion-gating"> Only run the AI when the scene changes (ignore a static empty bowl)
+            <span class="info-icon">i<span class="tooltip">Skips the vision model on frames with no motion since the last check, so a still empty scene never reaches the AI. Recommended - this is the main defense against empty-scene false alarms.</span></span>
+        </label>
+
+        <div id="motion-threshold-row">
+            <label>Motion sensitivity threshold
+                <span class="info-icon">i<span class="tooltip">Lower = more sensitive. Measured noise floor on a still scene is ~0.3, a moving cat ~20-48; 2.0 is a safe default.</span></span>
+            </label>
+            <input type="number" step="0.5" min="0" id="motion-threshold" value="{motion_threshold}">
+        </div>
+
+        <div style="border:1px solid var(--border, #d0d0d0); border-radius:8px; padding:10px; margin:12px 0;">
+            <label style="display:flex; align-items:center; gap:8px; margin:0;">
+                <input type="checkbox" id="zone-enabled" onchange="onZoneToggle()"> Restrict detection to a feeding zone (optional)
+                <span class="info-icon">i<span class="tooltip">Crop every frame to just the bowl area before analysis, so motion and objects elsewhere in the room are ignored.</span></span>
+            </label>
+            <div id="zone-picker" style="display:none; margin-top:10px;">
+                <button type="button" class="secondary" onclick="loadZoneSnapshot()">Load camera snapshot</button>
+                <p class="helper-text">Then click and drag on the image to draw a box around the feeder bowl.</p>
+                <div id="zone-canvas-wrap" style="position:relative; display:inline-block; max-width:100%; touch-action:none; user-select:none; cursor:crosshair;">
+                    <img id="zone-img" alt="camera snapshot" style="max-width:100%; display:block; border-radius:6px;">
+                    <div id="zone-rect" style="position:absolute; border:2px solid #16a34a; background:rgba(22,163,74,0.20); display:none; pointer-events:none;"></div>
+                </div>
+                <p class="helper-text" id="zone-coords"></p>
+                <button type="button" class="secondary" onclick="clearZone()">Clear box</button>
+            </div>
         </div>
 
         <label>Poll interval (seconds)
@@ -688,17 +713,13 @@ PAGE_TEMPLATE = """\
     <!-- SCREEN 5: Appearance ID -->
     <div class="screen" id="screen-5">
         <h2>Tell NomWatch about your pet(s)</h2>
-        <div class="placeholder">
-            <span class="placeholder-badge">PLACEHOLDER &mdash; NOT WIRED UP YET</span>
-            <p style="margin:4px 0;">
-                Describe your pet's species/color/breed (e.g. "black cat", "golden retriever named Max")
-                so detection could eventually be harnessed to specifically recognize your animal, rather
-                than any animal in frame. This is saved to your config, but detection.py does not use it
-                yet &mdash; it's a placeholder for a future improvement, not a working feature.
-            </p>
-            <label style="margin-top:8px;">Pet description</label>
-            <input type="text" id="pet-description" placeholder="e.g. black cat, golden retriever named Max" value="{pet_description}">
-        </div>
+        <p class="helper-text">
+            Describe your pet's species/color/breed (e.g. "black cat", "golden retriever named Max").
+            This is fed to the vision model as a hint so it looks for your specific animal and can rule
+            out other animals or people near the bowl. Optional - leave blank to detect any animal.
+        </p>
+        <label style="margin-top:8px;">Pet description</label>
+        <input type="text" id="pet-description" placeholder="e.g. black cat, golden retriever named Max" value="{pet_description}">
 
         <button onclick="saveAppearanceAndAdvance()">Continue</button>
         <button class="secondary" onclick="goToScreen(4)">Back</button>
@@ -879,20 +900,150 @@ PAGE_TEMPLATE = """\
             if (['poll-interval', 'required-eating'].includes(e.target.id)) updateDebounceMath();
         }});
 
+        // --- detection engine + zone picker ---
+        const DETECTION_INIT = {{
+            engine: "{detection_engine}",
+            motion_gating: {motion_gating_js},
+            zone_enabled: {zone_enabled_js},
+            zone: {zone_js}
+        }};
+        let zoneNorm = DETECTION_INIT.zone;  // normalized {{x,y,w,h}} or null
+
+        function updateEngineUI() {{
+            const sel = document.querySelector('input[name="detection-engine"]:checked');
+            const engine = sel ? sel.value : 'ollama';
+            document.getElementById('motion-gating-row').style.display = (engine === 'ollama') ? 'flex' : 'none';
+            const gating = document.getElementById('motion-gating').checked;
+            const motionUsed = (engine === 'motion' || engine === 'hybrid' || (engine === 'ollama' && gating));
+            document.getElementById('motion-threshold-row').style.display = motionUsed ? 'block' : 'none';
+        }}
+        function initDetectionForm() {{
+            const radio = document.querySelector(`input[name="detection-engine"][value="${{DETECTION_INIT.engine}}"]`);
+            if (radio) radio.checked = true;
+            document.getElementById('motion-gating').checked = DETECTION_INIT.motion_gating;
+            if (DETECTION_INIT.zone_enabled) {{
+                document.getElementById('zone-enabled').checked = true;
+                onZoneToggle();
+            }}
+            updateEngineUI();
+        }}
+        document.addEventListener('change', (e) => {{
+            if (e.target.name === 'detection-engine' || e.target.id === 'motion-gating') updateEngineUI();
+        }});
+        if (document.readyState !== 'loading') initDetectionForm();
+        else window.addEventListener('DOMContentLoaded', initDetectionForm);
+
+        function onZoneToggle() {{
+            const on = document.getElementById('zone-enabled').checked;
+            document.getElementById('zone-picker').style.display = on ? 'block' : 'none';
+        }}
+        function zoneText(n) {{
+            return `Zone: ${{Math.round(n.w*100)}}% x ${{Math.round(n.h*100)}}% of frame, ` +
+                   `top-left at (${{Math.round(n.x*100)}}%, ${{Math.round(n.y*100)}}%).`;
+        }}
+        function drawZoneRect(n) {{
+            const img = document.getElementById('zone-img');
+            const rect = document.getElementById('zone-rect');
+            rect.style.display = 'block';
+            rect.style.left = (n.x * img.clientWidth) + 'px';
+            rect.style.top = (n.y * img.clientHeight) + 'px';
+            rect.style.width = (n.w * img.clientWidth) + 'px';
+            rect.style.height = (n.h * img.clientHeight) + 'px';
+        }}
+        function clearZone() {{
+            zoneNorm = null;
+            document.getElementById('zone-rect').style.display = 'none';
+            document.getElementById('zone-coords').textContent = 'Zone cleared - the full frame will be analysed.';
+        }}
+        async function loadZoneSnapshot() {{
+            const coords = document.getElementById('zone-coords');
+            coords.textContent = 'Loading snapshot...';
+            let data;
+            try {{
+                const res = await fetch('/api/snapshot');
+                data = await res.json();
+            }} catch (err) {{ coords.textContent = 'Could not load snapshot.'; return; }}
+            if (!data.ok) {{ coords.textContent = 'Could not load snapshot: ' + (data.error || ''); return; }}
+            const img = document.getElementById('zone-img');
+            img.onload = () => {{ if (zoneNorm) drawZoneRect(zoneNorm); }};
+            img.src = 'data:image/jpeg;base64,' + data.image;
+            coords.textContent = zoneNorm ? zoneText(zoneNorm) : 'Click and drag on the image to draw the feeding zone.';
+        }}
+        (function setupZoneDrag() {{
+            const wrap = document.getElementById('zone-canvas-wrap');
+            if (!wrap) return;
+            let dragging = false, sx = 0, sy = 0;
+            const relative = (e) => {{
+                const img = document.getElementById('zone-img');
+                const r = img.getBoundingClientRect();
+                const cx = e.clientX, cy = e.clientY;
+                return {{ x: Math.min(Math.max(cx - r.left, 0), r.width), y: Math.min(Math.max(cy - r.top, 0), r.height) }};
+            }};
+            wrap.addEventListener('pointerdown', (e) => {{
+                const img = document.getElementById('zone-img');
+                if (!img.src) return;
+                dragging = true;
+                const p = relative(e);
+                sx = p.x; sy = p.y;
+                const rect = document.getElementById('zone-rect');
+                rect.style.display = 'block';
+                rect.style.left = sx + 'px'; rect.style.top = sy + 'px';
+                rect.style.width = '0px'; rect.style.height = '0px';
+                e.preventDefault();
+            }});
+            wrap.addEventListener('pointermove', (e) => {{
+                if (!dragging) return;
+                const p = relative(e);
+                const rect = document.getElementById('zone-rect');
+                rect.style.left = Math.min(sx, p.x) + 'px';
+                rect.style.top = Math.min(sy, p.y) + 'px';
+                rect.style.width = Math.abs(p.x - sx) + 'px';
+                rect.style.height = Math.abs(p.y - sy) + 'px';
+            }});
+            const finish = (e) => {{
+                if (!dragging) return;
+                dragging = false;
+                const p = relative(e);
+                const img = document.getElementById('zone-img');
+                const x = Math.min(sx, p.x) / img.clientWidth;
+                const y = Math.min(sy, p.y) / img.clientHeight;
+                const w = Math.abs(p.x - sx) / img.clientWidth;
+                const h = Math.abs(p.y - sy) / img.clientHeight;
+                if (w < 0.02 || h < 0.02) {{ document.getElementById('zone-coords').textContent = 'Box too small - drag a larger area.'; return; }}
+                zoneNorm = {{ x: +x.toFixed(4), y: +y.toFixed(4), w: +w.toFixed(4), h: +h.toFixed(4) }};
+                document.getElementById('zone-coords').textContent = zoneText(zoneNorm);
+            }};
+            wrap.addEventListener('pointerup', finish);
+            wrap.addEventListener('pointerleave', finish);
+        }})();
+
         async function saveDetectionAndAdvance() {{
             const poll = parseInt(document.getElementById('poll-interval').value) || 10;
             const eating = parseInt(document.getElementById('required-eating').value) || 20;
             const preRoll = parseInt(document.getElementById('pre-roll').value) || 0;
             const postConfirm = parseInt(document.getElementById('post-confirm').value) || 0;
+            const engine = document.querySelector('input[name="detection-engine"]:checked').value;
+            const motionGating = document.getElementById('motion-gating').checked;
+            const motionThreshold = parseFloat(document.getElementById('motion-threshold').value) || 2.0;
+            const zoneEnabled = document.getElementById('zone-enabled').checked && !!zoneNorm;
+            const body = {{
+                poll_interval_seconds: poll,
+                required_eating_seconds: eating,
+                pre_roll_seconds: preRoll,
+                clip_post_confirm_seconds: postConfirm,
+                engine: engine,
+                motion_gating: motionGating,
+                motion_threshold: motionThreshold,
+                zone_detection_enabled: zoneEnabled,
+            }};
+            if (zoneEnabled) {{
+                body.zone_x = zoneNorm.x; body.zone_y = zoneNorm.y;
+                body.zone_w = zoneNorm.w; body.zone_h = zoneNorm.h;
+            }}
             const res = await fetch('/api/save-detection', {{
                 method: 'POST',
                 headers: {{ 'Content-Type': 'application/json' }},
-                body: JSON.stringify({{
-                    poll_interval_seconds: poll,
-                    required_eating_seconds: eating,
-                    pre_roll_seconds: preRoll,
-                    clip_post_confirm_seconds: postConfirm,
-                }}),
+                body: JSON.stringify(body),
             }});
             const data = await res.json();
             const statusEl = document.getElementById('model-status');
@@ -1671,11 +1822,18 @@ def create_app():
     @app.route("/api/start-monitoring", methods=["POST"])
     def api_start_monitoring():
         cfg = _get_or_init_config()
-        if cfg.detection.engine != "ollama" or not cfg.detection.ollama_model:
+        engine = cfg.detection.engine
+        if engine not in ("ollama", "motion", "hybrid"):
             return jsonify({
                 "ok": False,
                 "pid": None,
-                "error": "No vision model is picked yet - finish detection setup first.",
+                "error": f"Detection engine '{engine}' can't be started from here - finish setup first.",
+            })
+        if engine in ("ollama", "hybrid") and not cfg.detection.ollama_model:
+            return jsonify({
+                "ok": False,
+                "pid": None,
+                "error": "No vision model is picked yet - finish detection setup, or choose the motion-only engine.",
             })
         external = _external_run_pids()
         if external:
@@ -1787,6 +1945,13 @@ def create_app():
     def setup_wizard():
         cfg = _get_or_init_config()
         ntfy_topic = cfg.notify.ntfy_topic or f"nomwatch-{secrets.token_hex(4)}"
+        det = cfg.detection
+        # A JS object literal (or "null") describing the saved zone, passed as a
+        # ready-made string so str.format doesn't try to re-parse its braces.
+        if None not in (det.zone_x, det.zone_y, det.zone_w, det.zone_h):
+            zone_js = "{" + f"x:{det.zone_x},y:{det.zone_y},w:{det.zone_w},h:{det.zone_h}" + "}"
+        else:
+            zone_js = "null"
         # html.escape everything user-controlled: a camera password (or any
         # field) containing a double-quote used to break out of its value=""
         # attribute and mangle the whole form.
@@ -1803,6 +1968,11 @@ def create_app():
             ntfy_topic=html.escape(ntfy_topic, quote=True),
             local_save_dir=html.escape(cfg.storage.local_save_dir or "", quote=True),
             pet_description=html.escape(cfg.detection.pet_description or "", quote=True),
+            detection_engine=det.engine,
+            motion_gating_js=("true" if det.motion_gating else "false"),
+            motion_threshold=det.motion_threshold,
+            zone_enabled_js=("true" if det.zone_detection_enabled else "false"),
+            zone_js=zone_js,
         )
 
     # --- Screen 1: camera ---------------------------------------------------
@@ -1844,6 +2014,19 @@ def create_app():
                 "detail": ffmpeg_error,
                 "hints": hints,
             })
+        return jsonify({"ok": True, "image": base64.b64encode(frame).decode("ascii")})
+
+    @app.route("/api/snapshot")
+    def api_snapshot():
+        """Single still frame from the ALREADY-SAVED camera config (for the
+        zone picker background). Unlike /api/test-camera it takes no body -
+        the camera is configured on screen 1 before the zone picker is used."""
+        cfg = load_config()
+        if cfg is None or not cfg.camera.ip:
+            return jsonify({"ok": False, "error": "No camera configured yet - complete step 1 first."})
+        frame, ffmpeg_error = capture_frame_with_error(rtsp_url(cfg))
+        if frame is None:
+            return jsonify({"ok": False, "error": ffmpeg_error or "Could not capture a frame from the camera."})
         return jsonify({"ok": True, "image": base64.b64encode(frame).decode("ascii")})
 
     # --- Screen 6: live stream ------------------------------------------------
@@ -1947,29 +2130,65 @@ def create_app():
         # Mutate the existing detection config instead of rebuilding it from
         # scratch - rebuilding silently wiped every field this screen
         # doesn't own (pet_description from screen 5, min_confidence,
-        # ollama_host, the zone placeholder flag) each time someone re-ran
-        # the wizard.
-        warning = None
+        # ollama_host) each time someone re-ran the wizard.
+        requested_engine = str(data.get("engine", cfg.detection.engine or "ollama")).strip().lower()
+        if requested_engine not in ("ollama", "motion", "hybrid"):
+            requested_engine = "ollama"
+
+        # Discover the local vision model so ollama/hybrid can be validated.
+        available_model = None
         if probe_local_model_server(cfg.detection.ollama_host):
-            vision_model = pick_vision_model(list_local_models(cfg.detection.ollama_host))
-            if vision_model:
-                cfg.detection.engine = "ollama"
-                cfg.detection.ollama_model = vision_model
+            available_model = pick_vision_model(list_local_models(cfg.detection.ollama_host))
+
+        warning = None
+        if requested_engine in ("ollama", "hybrid"):
+            if available_model:
+                cfg.detection.engine = requested_engine
+                cfg.detection.ollama_model = available_model
+            elif cfg.detection.ollama_model:
+                # Ollama unreachable right now but a model was picked before -
+                # keep the choice, just warn.
+                cfg.detection.engine = requested_engine
+                warning = (
+                    "Couldn't reach Ollama just now - keeping the previously picked model "
+                    f"({cfg.detection.ollama_model}). Make sure Ollama is running before starting monitoring."
+                )
             else:
+                # No model at all - a vision engine can't run. Fall back to motion.
                 cfg.detection.engine = "motion"
                 cfg.detection.ollama_model = None
-                warning = "Ollama is running but has no vision-capable model - detection can't start until one is installed."
-        elif cfg.detection.ollama_model:
-            # Ollama unreachable RIGHT NOW but a model was already picked -
-            # keep it (a momentary hiccup shouldn't silently unconfigure
-            # detection), just tell the user.
-            warning = (
-                "Couldn't reach Ollama just now - keeping the previously picked model "
-                f"({cfg.detection.ollama_model}). Make sure Ollama is running before starting monitoring."
-            )
-        else:
+                warning = (
+                    f"No vision-capable Ollama model is installed, so '{requested_engine}' "
+                    "can't run yet - saved as motion-only for now. Install a model "
+                    "(e.g. gemma3:4b) and re-run detection setup to enable the AI."
+                )
+        else:  # motion-only, no model needed
             cfg.detection.engine = "motion"
-            warning = "No local Ollama server detected - no vision model is configured yet."
+
+        # Motion tuning.
+        cfg.detection.motion_gating = bool(data.get("motion_gating", cfg.detection.motion_gating))
+        try:
+            mt = float(data.get("motion_threshold", cfg.detection.motion_threshold))
+            if mt > 0:
+                cfg.detection.motion_threshold = mt
+        except (TypeError, ValueError):
+            pass
+
+        # Zone crop (normalized coords). Any missing/invalid coordinate disables it.
+        cfg.detection.zone_detection_enabled = bool(data.get("zone_detection_enabled", False))
+        if cfg.detection.zone_detection_enabled:
+            try:
+                cfg.detection.zone_x = float(data["zone_x"])
+                cfg.detection.zone_y = float(data["zone_y"])
+                cfg.detection.zone_w = float(data["zone_w"])
+                cfg.detection.zone_h = float(data["zone_h"])
+            except (KeyError, TypeError, ValueError):
+                cfg.detection.zone_detection_enabled = False
+                cfg.detection.zone_x = cfg.detection.zone_y = None
+                cfg.detection.zone_w = cfg.detection.zone_h = None
+        else:
+            cfg.detection.zone_x = cfg.detection.zone_y = None
+            cfg.detection.zone_w = cfg.detection.zone_h = None
 
         cfg.detection.poll_interval_seconds = poll
         cfg.detection.required_eating_seconds = eating

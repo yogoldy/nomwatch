@@ -62,7 +62,7 @@ bridge devices - not being retired.
 - [x] Security hardening: mediamtx.yml (contains RTSP credentials) now written 0600; RTSP credentials percent-encoded in all URLs (special chars in passwords used to silently break the stream); MediaMTX/monitoring launched with CWD pinned to the config dir (MediaMTX was dropping auto-generated cert files into whatever directory the UI was started from); user-typed paths sanitized (a quoted paste created a literal `'` directory tree and clips silently went to the wrong place - found live)
 - [x] Mobile-responsive dashboard + wizard (viewport meta + responsive layout), for checking on the pet from a phone
 - [ ] Real progress indicator during `ollama pull` instead of blocking until done
-- [x] Screen 2: pre-roll/post-confirm timing controls with live debounce-math feedback (zone detection remains a clearly-labeled placeholder)
+- [x] Screen 2: pre-roll/post-confirm timing controls with live debounce-math feedback (engine selector, motion-gating, and a real drag-to-draw zone picker added in v0.7)
 - [x] Screen 3: storage - built with the SIMPLIFIED model (pre-roll cache
       always local; ONE final clip destination: local / Drive sync / Drive
       API / none). The "local AND Drive" combined destination from
@@ -75,8 +75,9 @@ bridge devices - not being retired.
 - [ ] Screen 5 (optional toggle, off by default): appearance identification
       - ask the local vision model to describe species/color/etc. as an
         enrichment of the feeding-event record, not a new event category.
-        (Screen exists as a labeled PLACEHOLDER: it saves a pet description
-        to config, but detection.py does not use it yet)
+        (The pet description IS now used by detection.py as of v0.7 - it's
+        fed into the vision prompt. The remaining unbuilt part is the
+        optional describe-appearance enrichment of the event record.)
 - [x] This also subsumes the earlier "event history/clip review" dashboard
       idea (previously listed here as v0.5's "web dashboard") - shipped as
       the dashboard clip gallery above
@@ -96,34 +97,32 @@ treated as the most important open problem in the project - a false
 notification (or worse, a false "upload nothing happened" silently eaten by
 debounce) undermines the entire premise of the tool. Decision, made
 2026-07-12: pursue all of the following together, not as alternatives -
-- [ ] **Motion-gating**: implement `MotionOnlyDetector` for real (currently
-      `NotImplementedError`) as a cheap frame-diff pre-filter. The vision
-      model is only ever invoked when motion against the previous frame
-      exceeds a threshold - an unchanging empty room never reaches the LLM
-      at all, which addresses the exact false-positive case found live.
-      `MotionOnlyDetector` should also be selectable as a fully standalone,
-      non-AI detection engine (`detection.engine: "motion"`) for anyone who
-      doesn't want to run a local model at all.
-- [ ] **Hybrid corroboration mode**: a new engine option where motion and
-      the vision model must BOTH agree before a streak counts toward
-      `consecutive_required` - motion alone is necessary but not
-      sufficient (also true when a pet walks past without eating), and
-      vision alone is what's currently producing empty-room false
-      positives. Requiring agreement should cut both failure directions.
-- [ ] **Zone cropping, wired for real**: screen 2's zone-detection
-      placeholder becomes a real bounding-box picker (drawn over the live
-      camera preview) whose coordinates are saved to config and used to
-      crop every frame - for both the motion-diff comparison and the image
-      sent to the vision model - to just the feeder/bowl area before
-      analysis, cutting out background the model has no business reasoning
-      about.
-- [ ] **Wire `detection.pet_description` into the real prompt** (currently
-      saved to config by screen 5 but never read by `detection.py` - see
-      the PROMPT constant). Telling the model what pet/species/color to
-      expect should reduce false positives from irrelevant motion (a
-      different animal, a person) and give it a concrete visual anchor
-      instead of an unconstrained judgment call.
-- [ ] Optional, if time allows: a setup-time calibration step - capture N
+
+**Root cause found + fixed (2026-07-12):** the model was answering "is there
+food in the bowl?" not "is an animal eating?". Confirmed live by capturing
+real frames and reading them: an empty IR scene with a full bowl fired
+FEEDING:yes 0.8 on 18/18 frames. Rewriting the prompt to require a *visible
+animal with head/mouth at the bowl* (food alone = hard NO), and wiring in
+`pet_description`, took that to **0/18 false positives with 6/6 real
+cat-eating frames still detected**. All items below then built on top:
+
+- [x] **Prompt fix + `pet_description` wiring** — `build_prompt(pet_description)`
+      in `detection.py`; "no visible animal" is now an explicit NO regardless
+      of food. Verified 100%→0% empty-scene false positives on the real camera.
+- [x] **Motion-gating**: `MotionOnlyDetector` implemented for real (ffmpeg
+      frame-diff, no image library). The vision model is only invoked when
+      motion vs. the previous frame exceeds `motion_threshold` (default 2.0;
+      measured noise floor ~0.3, moving cat ~20-48). Also selectable standalone
+      as `detection.engine: "motion"` (no model server needed).
+- [x] **Hybrid corroboration mode** (`detection.engine: "hybrid"`): motion AND
+      the vision model must both agree for a poll to count. Verified with an
+      injected-frame test: a model "yes" on a static frame is suppressed;
+      motion-only (walk-past) doesn't fire.
+- [x] **Zone cropping, wired for real**: real drag-to-draw bounding-box picker
+      on setup screen 2 (over a live camera snapshot); normalized coords saved
+      to config and applied via ffmpeg `crop` to BOTH the motion diff and the
+      image sent to the model. Verified live in-browser.
+- [ ] Optional, not done this pass: a setup-time calibration step - capture N
       frames of the actual empty feeder on THIS camera and run real
       classifications to measure this camera/model's baseline
       false-positive rate, then suggest a `min_confidence` /

@@ -31,6 +31,20 @@ Priority order, decided at startup:
 
 The detection layer's job is narrow: watch the stream, decide "this looks like a feeding event," and emit an event object (timestamp, confidence, short clip reference) to the rest of the pipeline. It is designed as a swappable interface so better engines can be dropped in later without touching the bridge or upload code.
 
+#### v0.7 detection reliability (implemented)
+
+The single-frame "ask a small vision model yes/no" approach was producing constant false positives: the model answered "is there food in the bowl?" instead of "is an animal eating?", firing on an empty scene with a full bowl (confirmed live: 18/18 empty-scene frames → false positive). Three cooperating mechanisms now address this, selectable via `detection.engine`:
+
+- **`motion`** — a non-AI floor. Frame-to-frame motion only; no model server needed. Cannot tell eating from walking past, but never fires on a static scene.
+- **`ollama`** — the vision model decides. With `motion_gating` on (default), the model is *not even called* on a frame with no motion since the last one, so a static bowl-with-food never reaches the LLM. This is the most direct fix for the empty-scene false positive.
+- **`hybrid`** — motion AND the vision model must both agree for a poll to count. Suppresses both empty-scene model hallucinations (nothing moved) and motion-only noise (a cat walking past without eating).
+
+The prompt itself was also rewritten to require a *visible animal with its head/mouth at the bowl* — "food in the bowl with no animal" is now an explicit hard NO. `detection.pet_description` is fed to the model as a hint. **Zone cropping** (`zone_detection_enabled` + normalized `zone_x/y/w/h`, drawable in the setup UI) crops every frame to just the bowl area before *both* the motion diff and the model call.
+
+#### Why no image library (ffmpeg-only motion + cropping)
+
+Motion detection and zone cropping are implemented with **ffmpeg alone** — no Pillow, numpy, or OpenCV. Motion is a mean-absolute-difference over a 48×48 grayscale thumbnail (ffmpeg decodes the JPEG to a raw gray buffer; the diff is a plain Python loop over ~2,304 bytes). Cropping uses ffmpeg's `crop` filter with `in_w/in_h` expressions, so no pixel dimensions or image library are needed. ffmpeg is *already* a hard dependency (frame capture + clip building), so reusing it keeps the dependency/attack surface tiny — the priority for a privacy-first, zero-bloat local tool. Pillow (simple pixel access) and numpy (fast array math) were considered; both were rejected as unnecessary weight for what is essentially a subtraction on a tiny grid. Revisit if per-region motion or heavier CV is ever needed.
+
 ### 4. Notifications
 v1 uses a free third-party push service — **ntfy.sh** or **Pushover** — chosen because both require no Apple Developer account, no custom iOS app, and no NomWatch-operated backend. A dedicated iOS app with native APNs push is a listed stretch goal, not a v1 requirement.
 

@@ -27,11 +27,15 @@ from .config import (
 )
 from .detection import (
     DEFAULT_VISION_MODEL,
+    FrameDiffMotion,
     OllamaVisionDetector,
+    Zone,
     capture_frame,
+    crop_to_zone,
     list_local_models,
     model_installed,
     pick_vision_model,
+    poll_stream,
     probe_local_model_server,
     pull_model,
 )
@@ -303,22 +307,33 @@ def status():
 
 @main.command()
 def detect_test():
-    """Grab one live frame from the configured camera and run a single detection pass."""
+    """Grab live frame(s) from the configured camera and run a single detection pass."""
     cfg = load_config()
     if cfg is None:
         click.echo("No config found. Run `nomwatch setup` first.")
         return
 
-    if cfg.detection.engine != "ollama" or not cfg.detection.ollama_model:
+    engine = cfg.detection.engine
+    if engine not in ("ollama", "motion", "hybrid"):
         click.echo(
-            f"Configured detection engine is '{cfg.detection.engine}', not 'ollama', "
-            "or no vision model was picked during setup. Nothing to test yet - "
-            "install a vision model (e.g. `ollama pull gemma3:4b`) and rerun `nomwatch setup`."
+            f"Configured detection engine is '{engine}' (supported: ollama, motion, "
+            "hybrid). Run `nomwatch setup`."
+        )
+        return
+    if engine in ("ollama", "hybrid") and not cfg.detection.ollama_model:
+        click.echo(
+            f"Detection engine is '{engine}' but no vision model was picked. Install one "
+            "(e.g. `ollama pull gemma3:4b`) and rerun `nomwatch setup`."
         )
         return
 
     stream_url = rtsp_url(cfg)
-    click.echo(f"Capturing a frame from {cfg.camera.ip}:{cfg.camera.rtsp_port}/{cfg.camera.stream_path} ...")
+    zone = Zone.from_config(cfg.detection)
+    zone_note = " (cropped to bowl zone)" if zone is not None else ""
+    click.echo(
+        f"[engine: {engine}] Capturing from "
+        f"{cfg.camera.ip}:{cfg.camera.rtsp_port}/{cfg.camera.stream_path}{zone_note} ..."
+    )
     frame = capture_frame(stream_url)
     if frame is None:
         click.echo(
@@ -326,24 +341,60 @@ def detect_test():
             "are correct, and the bridge device can reach the camera on the LAN."
         )
         return
+    analysed = crop_to_zone(frame, zone) if zone is not None else frame
 
-    click.echo(f"Captured {len(frame)} bytes. Asking {cfg.detection.ollama_model} ...")
+    # Motion needs two frames; grab a second one a moment later.
+    moved = motion_score = None
+    if engine in ("motion", "hybrid"):
+        motion = FrameDiffMotion(threshold=cfg.detection.motion_threshold)
+        first = motion.thumbnail(analysed)
+        time.sleep(1.0)
+        frame2 = capture_frame(stream_url)
+        analysed2 = crop_to_zone(frame2, zone) if (zone is not None and frame2) else frame2
+        second = motion.thumbnail(analysed2) if analysed2 else None
+        if first and second:
+            mres = motion.compare(first, second)
+            moved, motion_score = mres.moved, mres.score
+            click.echo(f"Motion between two frames: score {motion_score:.2f} "
+                       f"(threshold {cfg.detection.motion_threshold}) -> {'MOVED' if moved else 'still'}")
+        else:
+            click.echo("⚠️  Could not compute motion (frame capture/decode failed).")
+        analysed = analysed2 or analysed  # classify the newer frame in hybrid
+
+    if engine == "motion":
+        if moved:
+            click.echo(f"✅ MOTION detected near the bowl (score {motion_score:.2f}).")
+        else:
+            click.echo("❌ No motion detected.")
+        return
+
+    # ollama or hybrid: run the vision model.
+    click.echo(f"Asking {cfg.detection.ollama_model} ...")
     detector = OllamaVisionDetector(
         model=cfg.detection.ollama_model,
         host=cfg.detection.ollama_host,
         min_confidence=cfg.detection.min_confidence,
         pet_description=cfg.detection.pet_description,
     )
-    result = detector.classify(frame)
+    result = detector.classify(analysed)
     if result is None:
         click.echo("Could not reach the Ollama server to classify this frame.")
         return
 
-    if result.is_feeding and result.confidence >= cfg.detection.min_confidence:
-        click.echo(f"✅ FEEDING event (confidence {result.confidence:.2f}): {result.reason}")
-    else:
-        verdict = "feeding, but below confidence threshold" if result.is_feeding else "not feeding"
-        click.echo(f"❌ No feeding event ({verdict}, confidence {result.confidence:.2f}): {result.reason}")
+    llm_positive = result.is_feeding and result.confidence >= cfg.detection.min_confidence
+    if engine == "hybrid":
+        if llm_positive and moved:
+            click.echo(f"✅ FEEDING event (motion + vision agree, confidence {result.confidence:.2f}): {result.reason}")
+        elif llm_positive and not moved:
+            click.echo(f"❌ No feeding event: vision said feeding but nothing moved - suppressed (hybrid). {result.reason}")
+        else:
+            click.echo(f"❌ No feeding event (vision: not feeding, confidence {result.confidence:.2f}): {result.reason}")
+    else:  # ollama
+        if llm_positive:
+            click.echo(f"✅ FEEDING event (confidence {result.confidence:.2f}): {result.reason}")
+        else:
+            verdict = "feeding, but below confidence threshold" if result.is_feeding else "not feeding"
+            click.echo(f"❌ No feeding event ({verdict}, confidence {result.confidence:.2f}): {result.reason}")
 
 
 @main.command()
@@ -355,21 +406,37 @@ def run(once: bool):
         click.echo("No config found. Run `nomwatch setup` first.")
         return
 
-    if cfg.detection.engine != "ollama" or not cfg.detection.ollama_model:
+    engine = cfg.detection.engine
+    if engine not in ("ollama", "motion", "hybrid"):
         click.echo(
-            f"Configured detection engine is '{cfg.detection.engine}', not 'ollama', "
-            "or no vision model was picked during setup. Run `nomwatch setup` and install "
-            "a vision model first."
+            f"Configured detection engine is '{engine}', which `nomwatch run` "
+            "doesn't drive (supported: ollama, motion, hybrid). Run `nomwatch setup`."
+        )
+        return
+    if engine in ("ollama", "hybrid") and not cfg.detection.ollama_model:
+        click.echo(
+            f"Detection engine is '{engine}' but no vision model was picked during "
+            "setup. Run `nomwatch setup` and install a vision model first."
         )
         return
 
     stream_url = rtsp_url(cfg)
-    detector = OllamaVisionDetector(
-        model=cfg.detection.ollama_model,
-        host=cfg.detection.ollama_host,
-        min_confidence=cfg.detection.min_confidence,
-        pet_description=cfg.detection.pet_description,
-    )
+
+    # The vision model is only needed for the ollama/hybrid engines.
+    detector = None
+    if engine in ("ollama", "hybrid"):
+        detector = OllamaVisionDetector(
+            model=cfg.detection.ollama_model,
+            host=cfg.detection.ollama_host,
+            min_confidence=cfg.detection.min_confidence,
+            pet_description=cfg.detection.pet_description,
+        )
+    # Motion is needed for the motion engine, always for hybrid, and for
+    # ollama only when motion-gating is on.
+    motion = None
+    if engine in ("motion", "hybrid") or (engine == "ollama" and cfg.detection.motion_gating):
+        motion = FrameDiffMotion(threshold=cfg.detection.motion_threshold)
+    zone = Zone.from_config(cfg.detection)
 
     notifier = build_notifier(cfg.notify)
     try:
@@ -434,17 +501,29 @@ def run(once: bool):
             with open(classifications_path, "a") as f:
                 f.write(json.dumps({
                     "ts": payload["ts"],
+                    "engine": status.get("engine"),
                     "is_feeding": status.get("is_feeding"),
                     "confidence": status.get("confidence"),
                     "reason": status.get("reason"),
                     "raw_text": status.get("raw_text"),
+                    "moved": status.get("moved"),
+                    "motion_score": status.get("motion_score"),
+                    "gated": status.get("gated"),
                     "streak": status.get("streak"),
                     "frame_path": str(frame_path) if frame_path else None,
                 }) + "\n")
 
     log_path = CONFIG_DIR / "events.jsonl"
+    engine_desc = {
+        "ollama": f"vision model ({cfg.detection.ollama_model})"
+                  + (", motion-gated" if motion is not None else ""),
+        "motion": "motion only (no AI)",
+        "hybrid": f"motion + vision model ({cfg.detection.ollama_model}) must agree",
+    }[engine]
+    zone_desc = " | zone-cropped to bowl area" if zone is not None else ""
     click.echo(
-        f"Watching {cfg.camera.ip} every {cfg.detection.poll_interval_seconds}s, "
+        f"Watching {cfg.camera.ip} every {cfg.detection.poll_interval_seconds}s "
+        f"[engine: {engine_desc}{zone_desc}], "
         f"requiring {cfg.detection.consecutive_required} consecutive positive checks "
         f"(~{cfg.detection.consecutive_required * cfg.detection.poll_interval_seconds}s of eating) "
         f"before logging an event. Log: {log_path}\n"
@@ -452,8 +531,13 @@ def run(once: bool):
         "(Ctrl+C to stop)\n"
     )
 
-    events = detector.poll_stream(
+    events = poll_stream(
         stream_url,
+        engine=engine,
+        detector=detector,
+        motion=motion,
+        motion_gating=cfg.detection.motion_gating,
+        zone=zone,
         interval_seconds=cfg.detection.poll_interval_seconds,
         consecutive_required=cfg.detection.consecutive_required,
         on_poll=write_heartbeat,

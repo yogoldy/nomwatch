@@ -187,6 +187,142 @@ def capture_frame(stream_url: str, timeout: int = 10) -> Optional[bytes]:
     return frame
 
 
+# --- Motion detection + zone cropping (ffmpeg-only, no image library) -------
+# Deliberately implemented with ffmpeg alone rather than pulling in Pillow /
+# numpy / OpenCV. See docs/ARCHITECTURE.md ("Why no image library") for the
+# tradeoff: this keeps NomWatch's dependency surface tiny for a privacy-first
+# local tool, at the cost of shelling out to ffmpeg (already a hard dependency
+# for frame capture and clips) per frame instead of doing array math in-process.
+
+MOTION_THUMB_SIZE = 48  # downscale grid for the motion diff
+
+
+def _gray_thumbnail(jpeg_bytes: bytes, size: int = MOTION_THUMB_SIZE) -> Optional[bytes]:
+    """
+    Decode a JPEG to a `size`x`size` single-channel grayscale raw buffer using
+    ffmpeg. Returns size*size bytes (one 0-255 value per pixel), or None on
+    failure. Downscaling to a tiny grid makes the frame-to-frame diff cheap AND
+    smooths out per-pixel IR sensor noise, so a genuinely static scene reads as
+    near-zero motion (measured ~0.3 MAD on the real camera).
+    """
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-i", "pipe:0",
+             "-vf", f"scale={size}:{size},format=gray",
+             "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"],
+            input=jpeg_bytes, capture_output=True, timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    data = proc.stdout
+    return data if data and len(data) >= size * size else None
+
+
+@dataclass
+class MotionResult:
+    score: float             # mean absolute difference between frames, 0-255
+    changed_fraction: float  # fraction of pixels changed beyond per_pixel_delta
+    moved: bool              # score >= threshold
+
+
+class FrameDiffMotion:
+    """
+    Cheap frame-to-frame motion detector built entirely on ffmpeg (no Python
+    image library). Compares the current frame against the previous one on a
+    downscaled grayscale grid and reports a motion score.
+
+    Measured on the real camera (2026-07-12): a static empty scene sits at
+    MAD ~0.3 (pure IR sensor noise), while a cat moving at the bowl is MAD
+    ~20-48 - a ~50x gap - so the default threshold (2.0) has a very wide
+    margin. The threshold is deliberately LOW: a false "motion" only means the
+    vision model gets consulted (and the fixed prompt correctly says "no cat"),
+    which is harmless; a MISSED motion could drop a real feeding, which is not.
+    """
+
+    def __init__(self, threshold: float = 2.0, size: int = MOTION_THUMB_SIZE,
+                 per_pixel_delta: int = 20):
+        self.threshold = threshold
+        self.size = size
+        self.per_pixel_delta = per_pixel_delta
+
+    def thumbnail(self, jpeg_bytes: bytes) -> Optional[bytes]:
+        return _gray_thumbnail(jpeg_bytes, self.size)
+
+    def compare(self, prev_thumb: bytes, cur_thumb: bytes) -> MotionResult:
+        n = min(len(prev_thumb), len(cur_thumb))
+        if n == 0:
+            return MotionResult(0.0, 0.0, False)
+        total = 0
+        changed = 0
+        for i in range(n):
+            d = prev_thumb[i] - cur_thumb[i]
+            if d < 0:
+                d = -d
+            total += d
+            if d >= self.per_pixel_delta:
+                changed += 1
+        score = total / n
+        return MotionResult(
+            score=score,
+            changed_fraction=changed / n,
+            moved=score >= self.threshold,
+        )
+
+
+@dataclass
+class Zone:
+    """Normalized bounding box (all in 0.0-1.0, fractions of frame w/h)."""
+    x: float
+    y: float
+    w: float
+    h: float
+
+    def valid(self) -> bool:
+        return (
+            0.0 <= self.x < 1.0 and 0.0 <= self.y < 1.0
+            and 0.0 < self.w <= 1.0 and 0.0 < self.h <= 1.0
+            and self.x + self.w <= 1.0001 and self.y + self.h <= 1.0001
+            # A near-full-frame "zone" is just no zone; ignore trivial ones.
+            and not (self.w > 0.99 and self.h > 0.99)
+        )
+
+    @classmethod
+    def from_config(cls, det) -> Optional["Zone"]:
+        """Build a Zone from a DetectionConfig, or None if not enabled/complete."""
+        if not getattr(det, "zone_detection_enabled", False):
+            return None
+        coords = (det.zone_x, det.zone_y, det.zone_w, det.zone_h)
+        if any(c is None for c in coords):
+            return None
+        zone = cls(*[float(c) for c in coords])
+        return zone if zone.valid() else None
+
+
+def crop_to_zone(jpeg_bytes: bytes, zone: Optional[Zone]) -> bytes:
+    """
+    Crop a JPEG to a normalized bounding box using ffmpeg's crop filter with
+    in_w/in_h expressions - so we never need the pixel dimensions or an image
+    library. Returns the cropped JPEG, or the ORIGINAL bytes unchanged if the
+    zone is absent/invalid or the crop fails (a crop hiccup must never break
+    the detection pipeline).
+    """
+    if zone is None or not zone.valid():
+        return jpeg_bytes
+    vf = (
+        f"crop=in_w*{zone.w:.4f}:in_h*{zone.h:.4f}:"
+        f"in_w*{zone.x:.4f}:in_h*{zone.y:.4f}"
+    )
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-i", "pipe:0", "-vf", vf,
+             "-frames:v", "1", "-f", "image2", "-c:v", "mjpeg", "-q:v", "3", "pipe:1"],
+            input=jpeg_bytes, capture_output=True, timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return jpeg_bytes
+    return proc.stdout if proc.returncode == 0 and proc.stdout else jpeg_bytes
+
+
 # --- Ollama vision detector --------------------------------------------------
 
 def build_prompt(pet_description: Optional[str] = None) -> str:
@@ -334,90 +470,6 @@ class OllamaVisionDetector(DetectionEngine):
             pass
         return is_feeding, confidence, reason
 
-    def poll_stream(
-        self,
-        stream_url: str,
-        interval_seconds: int = 10,
-        consecutive_required: int = 2,
-        on_poll=None,
-    ):
-        """
-        Generator: captures a frame every `interval_seconds` and yields a
-        FeedingEvent only once `consecutive_required` polls IN A ROW have all
-        independently judged "feeding" above min_confidence. Runs indefinitely -
-        caller decides how to consume it (e.g. wire to notify.py / storage.py).
-
-        This debounce exists because a single frame can be wrongly classified
-        with real confidence (observed in practice: the model confidently
-        misreading an atypical camera angle) - requiring several agreeing
-        polls in a row, spanning real wall-clock seconds of actual behavior,
-        makes a single bad frame far less likely to trigger a false alert.
-        Only one event is yielded per continuous feeding streak (it won't
-        re-fire every poll while the pet keeps eating) - the streak resets
-        once a poll comes back negative.
-
-        `on_poll`, if given, is called after EVERY cycle with a status dict
-        (ok / is_feeding / confidence / reason / streak / error) - this is
-        the loop's heartbeat, letting a dashboard answer "is this thing
-        actually alive and what did it last see" without tailing a log file.
-        """
-        streak = 0
-        already_fired = False
-        best_confidence = 0.0
-        best_reason = ""
-
-        while True:
-            status = {"ok": False, "is_feeding": False, "confidence": None, "reason": None, "error": None}
-            frame = capture_frame(stream_url)
-            if frame is None:
-                status["error"] = "frame capture failed (camera unreachable, or ffmpeg problem)"
-            else:
-                result = self.classify(frame)
-                if result is None:
-                    status["error"] = "vision model unreachable (is Ollama still running?)"
-                else:
-                    status.update(
-                        ok=True,
-                        is_feeding=result.is_feeding,
-                        confidence=result.confidence,
-                        reason=result.reason,
-                        raw_text=result.raw_text,
-                    )
-                    # Only attach the actual frame bytes when the model said
-                    # "yes" - this is the diagnostic case that matters (why
-                    # did it think this was feeding), and doing it for every
-                    # single poll would be a lot of needless disk churn on a
-                    # camera polled every few seconds. The caller (cli.py) is
-                    # responsible for saving this to disk and NOT persisting
-                    # it into the heartbeat file itself.
-                    if result.is_feeding:
-                        status["frame_bytes"] = frame
-                    if result.is_feeding and result.confidence >= self.min_confidence:
-                        streak += 1
-                        best_confidence = max(best_confidence, result.confidence)
-                        best_reason = result.reason
-                        if streak >= consecutive_required and not already_fired:
-                            already_fired = True
-                            if on_poll:
-                                on_poll({**status, "streak": streak})
-                            yield FeedingEvent(
-                                timestamp=time.time(),
-                                confidence=best_confidence,
-                                reasoning=best_reason,
-                            )
-                            # skip the duplicate on_poll below for this cycle
-                            time.sleep(interval_seconds)
-                            continue
-                    else:
-                        streak = 0
-                        already_fired = False
-                        best_confidence = 0.0
-                        best_reason = ""
-            if on_poll:
-                on_poll({**status, "streak": streak})
-            time.sleep(interval_seconds)
-
-
 class FrigateDetector(DetectionEngine):
     """
     Stub integration point for consuming Frigate (or similar) as the
@@ -433,10 +485,194 @@ class FrigateDetector(DetectionEngine):
 
 
 class MotionOnlyDetector(DetectionEngine):
-    """Minimum viable fallback: simple frame-diff motion detection. Not yet implemented."""
+    """
+    Fully non-AI fallback (`detection.engine = "motion"`): flags "activity"
+    purely from frame-to-frame motion, no vision model required at all. Far
+    cruder than the vision model - it cannot tell a cat eating from a cat
+    walking past or a person reaching in - but it needs no model server and
+    never produces the empty-scene "there's food in the bowl" false positive,
+    because a static scene simply has no motion. Keeps the previous frame's
+    thumbnail as state across calls, so the first call always returns None
+    (no baseline yet).
+    """
 
-    def __init__(self, threshold: float = 25.0):
-        self.threshold = threshold
+    def __init__(self, threshold: float = 2.0):
+        self.motion = FrameDiffMotion(threshold=threshold)
+        self._prev_thumb: Optional[bytes] = None
 
     def check_frame(self, frame_bytes: bytes) -> Optional[FeedingEvent]:
-        raise NotImplementedError("Frame-diff motion detection - see docs/ROADMAP.md v0.3")
+        thumb = self.motion.thumbnail(frame_bytes)
+        prev = self._prev_thumb
+        if thumb is not None:
+            self._prev_thumb = thumb
+        if prev is None or thumb is None:
+            return None
+        res = self.motion.compare(prev, thumb)
+        if not res.moved:
+            return None
+        # Crude confidence: how far above threshold the motion sits, capped.
+        confidence = min(1.0, res.score / (self.motion.threshold * 10 or 1.0))
+        return FeedingEvent(
+            timestamp=time.time(),
+            confidence=confidence,
+            reasoning=f"motion near the bowl (score {res.score:.1f})",
+        )
+
+
+# --- Engine-aware polling driver --------------------------------------------
+
+def poll_stream(
+    stream_url: str,
+    *,
+    engine: str = "ollama",
+    detector: Optional[OllamaVisionDetector] = None,
+    motion: Optional[FrameDiffMotion] = None,
+    motion_gating: bool = True,
+    zone: Optional[Zone] = None,
+    interval_seconds: int = 10,
+    consecutive_required: int = 2,
+    on_poll=None,
+):
+    """
+    Generator that drives the whole detection pipeline and yields a
+    FeedingEvent once `consecutive_required` polls IN A ROW have all come back
+    positive. Runs indefinitely; the caller decides how to consume events
+    (notify / record clip / log). Supports three engines:
+
+    - "motion": non-AI. A poll is positive iff frame-to-frame motion exceeds
+      the threshold. `detector` is unused.
+    - "ollama": the vision model decides. If `motion` is provided and
+      `motion_gating` is on, the model is NOT even called on a static frame
+      (no motion since the last frame) - that static frame is simply negative.
+      This is the single most direct fix for the empty-scene false positive:
+      an unchanging bowl-with-food never reaches the LLM.
+    - "hybrid": motion AND the vision model must BOTH agree for a poll to
+      count. Motion alone (a cat walking past) is not enough; a model "yes" on
+      a static frame (the residual hallucination the fixed prompt can still
+      occasionally produce) is suppressed because nothing moved.
+
+    Every frame is optionally cropped to `zone` FIRST, so both the motion diff
+    and the image sent to the model see only the bowl area.
+
+    `on_poll`, if given, is called after EVERY cycle with a status dict
+    (ok / is_feeding / confidence / reason / moved / motion_score / gated /
+    streak / error, plus frame_bytes on a positive) - the loop's heartbeat and
+    the source of the per-poll diagnostic log.
+    """
+    streak = 0
+    already_fired = False
+    best_confidence = 0.0
+    best_reason = ""
+    prev_thumb: Optional[bytes] = None
+
+    def emit(status, streak_val):
+        if on_poll:
+            on_poll({**status, "streak": streak_val})
+
+    while True:
+        status = {
+            "ok": False, "is_feeding": False, "confidence": None,
+            "reason": None, "error": None, "engine": engine,
+            "moved": None, "motion_score": None, "gated": False,
+        }
+        frame = capture_frame(stream_url)
+        if frame is None:
+            status["error"] = "frame capture failed (camera unreachable, or ffmpeg problem)"
+            emit(status, streak)
+            time.sleep(interval_seconds)
+            continue
+
+        # Crop to the configured zone (if any) before ANY analysis, so motion
+        # and the vision model both reason only about the bowl area.
+        analysed = crop_to_zone(frame, zone) if zone is not None else frame
+        status["zone_cropped"] = zone is not None
+
+        # --- motion (computed whenever a motion detector is present) ---
+        moved: Optional[bool] = None
+        if motion is not None:
+            thumb = motion.thumbnail(analysed)
+            if prev_thumb is not None and thumb is not None:
+                mres = motion.compare(prev_thumb, thumb)
+                moved = mres.moved
+                status["motion_score"] = round(mres.score, 2)
+            else:
+                # First frame (or a decode failure): no baseline yet. Treat as
+                # "no motion" so we don't fire on startup, but never gate out
+                # the very first model call in plain ollama mode below.
+                moved = False
+            if thumb is not None:
+                prev_thumb = thumb
+        status["moved"] = moved
+
+        # --- engine decision -> `positive` (does this poll count?) ---
+        positive = False
+        if engine == "motion":
+            status["ok"] = True
+            positive = bool(moved)
+            status["is_feeding"] = positive
+            status["confidence"] = 1.0 if positive else 0.0
+            status["reason"] = (
+                f"motion detected near the bowl (score {status['motion_score']})"
+                if positive else "no motion since last frame"
+            )
+        else:
+            # "ollama" or "hybrid" - both use the vision model.
+            gated_out = motion is not None and motion_gating and moved is False
+            if gated_out:
+                status["ok"] = True
+                status["is_feeding"] = False
+                status["confidence"] = 0.0
+                status["reason"] = "no motion since last frame; vision model skipped"
+                status["gated"] = True
+            else:
+                result = detector.classify(analysed) if detector else None
+                if result is None:
+                    status["error"] = "vision model unreachable (is Ollama still running?)"
+                    emit(status, streak)
+                    time.sleep(interval_seconds)
+                    continue
+                status["ok"] = True
+                status["confidence"] = result.confidence
+                status["reason"] = result.reason
+                status["raw_text"] = result.raw_text
+                llm_positive = result.is_feeding and result.confidence >= detector.min_confidence
+                if engine == "hybrid":
+                    positive = bool(llm_positive and moved)
+                    status["is_feeding"] = positive
+                    if llm_positive and moved is False:
+                        status["reason"] = (
+                            "vision model said feeding but nothing moved - suppressed "
+                            f"(hybrid). Model said: {result.reason}"
+                        )
+                else:  # plain ollama
+                    positive = llm_positive
+                    status["is_feeding"] = positive
+
+        # Attach the analysed frame only when this poll is positive - that's
+        # the diagnostic case worth saving to disk (why did it think feeding?).
+        if positive:
+            status["frame_bytes"] = analysed
+
+        # --- debounce / streak ---
+        if positive:
+            streak += 1
+            best_confidence = max(best_confidence, status.get("confidence") or 0.0)
+            best_reason = status.get("reason") or best_reason
+            if streak >= consecutive_required and not already_fired:
+                already_fired = True
+                emit(status, streak)
+                yield FeedingEvent(
+                    timestamp=time.time(),
+                    confidence=best_confidence,
+                    reasoning=best_reason,
+                )
+                time.sleep(interval_seconds)
+                continue
+        else:
+            streak = 0
+            already_fired = False
+            best_confidence = 0.0
+            best_reason = ""
+
+        emit(status, streak)
+        time.sleep(interval_seconds)
