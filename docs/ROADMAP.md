@@ -150,6 +150,40 @@ while doing it. Verified live on 2026-07-12.
       `motion_threshold` (were config-only), so calibration's suggestions are
       one edit away.
 
+## v1.0 — Native macOS app
+Decision (2026-07-13): NomWatch becomes a real native macOS app, not only a
+web app. The web UI stays (officially "both", later); the native app is the
+new primary face on the Mac. Startup is a proper macOS mechanism (Login Item),
+NOT a launchd agent running a shell script - that "suspicious background bash"
+model is explicitly being retired for the app.
+- [x] **Native menu-bar app** (`nomwatch app`, `nomwatch/macapp.py`): pure
+      pyobjc/AppKit (new `nomwatch[app]` extra), runs as an LSUIElement
+      (menu-bar only, no Dock icon). Status glyph reflects state - green
+      active / red stale-or-error / hollow stopped - with a live "last saw the
+      bowl Ns ago" line. Menu: Start / Stop / Restart, Open NomWatch, Advanced
+      setup (web), Start at login, Quit. Verified live: the menu-bar item
+      renders and shows green/active against the real running loop.
+- [x] **Supervises monitoring itself** (via the new shared `runctl.py`, also
+      used by the web UI): auto-starts the loop on launch and keeps it alive
+      while running (the app IS the KeepAlive now) - replacing the launchd
+      agent. Quitting the app leaves the detached loop running.
+- [x] **Native main window** ("Open NomWatch"): AppKit window with monitoring
+      status + Start/Stop/Restart, a Start-at-login switch, a detection summary,
+      and a recent-events list. Builds/opens/populates live.
+- [x] **Login Item startup** via `SMAppService` (System Settings → Login
+      Items), the non-launchd, non-bash mechanism.
+- [x] **`nomwatch build-app`**: builds an unsigned, machine-local
+      `NomWatch.app` bundle (LSUIElement Info.plist; launcher quotes the
+      interpreter path so a venv under `Documents (local)/` works).
+- [ ] **Deferred to a v1.x follow-up (scoped honestly):**
+      - The 6-screen first-run **setup wizard stays on the web UI** for now
+        (reached via "Advanced setup (web)"); a native port is its own effort.
+      - A **py2app-built bundle** for a proper app identity (a script-launched
+        Python app currently presents as "Python"), reliable `SMAppService`
+        login-item registration, and optional Developer-ID **signing +
+        notarization** for zero-friction distribution to others.
+      - Native **live video** (AVKit/HLS) and a native clip gallery.
+
 ## Client/viewer architecture decision
 NomWatch always requires one real host machine (Mac, and eventually
 Linux/Windows) running the bridge (MediaMTX + detection + web UI). Phones,

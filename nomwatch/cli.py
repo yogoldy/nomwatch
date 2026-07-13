@@ -686,6 +686,33 @@ def ui(port: int):
     run_ui(port=port)
 
 
+@main.command()
+@click.option("--open", "open_window", is_flag=True, help="Open the main window immediately on launch.")
+def app(open_window: bool):
+    """Launch the native macOS menu-bar app (requires the `app` extra)."""
+    from .macapp import run_app
+
+    error = run_app(open_window=open_window)
+    if error:
+        click.echo(error)
+
+
+@main.command("build-app")
+@click.option("--dest", default=None, help="Where to write NomWatch.app (default: ./dist).")
+def build_app(dest):
+    """Build a NomWatch.app bundle (unsigned, this machine) for the menu-bar app."""
+    import sys as _sys
+    from .macapp import build_app_bundle
+
+    dest_dir = Path(dest) if dest else (Path.cwd() / "dist")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    bundle = build_app_bundle(dest_dir, python_exe=_sys.executable)
+    click.echo(f"✅ Built {bundle}")
+    click.echo(f"   Launch it with:  open '{bundle}'")
+    click.echo("   First launch: right-click → Open (unsigned app, one-time Gatekeeper approval).")
+    click.echo("   Then use the menu-bar icon's 'Start at login' to register it as a Login Item.")
+
+
 def _path_stats(path: Path) -> tuple[int, int]:
     """Returns (file_count, total_bytes) for a file or directory tree."""
     if path.is_file():

@@ -88,6 +88,7 @@ from .service import (
     uninstall_launchd_service,
 )
 from .storage import find_google_drive_sync_folder
+from . import runctl
 
 # --- "Start monitoring right now" process management -----------------------
 # Separate from the optional launchd auto-start-on-login service (see
@@ -95,11 +96,21 @@ from .storage import find_google_drive_sync_folder
 # loop actually starts running" path, tracked by PID the same way bridge.py
 # tracks the MediaMTX process.
 
-RUN_PID_PATH = CONFIG_DIR / "run.pid"
 EVENTS_LOG_PATH = CONFIG_DIR / "events.jsonl"
-HEARTBEAT_PATH = CONFIG_DIR / "heartbeat.json"
 CLIPS_DIR = CONFIG_DIR / "clips"
 THUMBNAILS_DIR = CONFIG_DIR / "thumbnails"
+
+# Monitoring-loop process control lives in runctl.py now (shared with the
+# native macOS menu-bar app). Keep the old private names as thin aliases so the
+# rest of this module is untouched.
+RUN_PID_PATH = runctl.RUN_PID_PATH
+HEARTBEAT_PATH = runctl.HEARTBEAT_PATH
+_run_loop_pid_running = runctl.run_loop_pid
+_external_run_pids = runctl.external_run_pids
+_read_heartbeat = runctl.read_heartbeat
+_config_changed_since = runctl.config_changed_since
+_start_run_loop = runctl.start_run_loop
+_stop_run_loop = runctl.stop_run_loop
 
 
 def _get_or_init_config() -> NomWatchConfig:
@@ -107,111 +118,6 @@ def _get_or_init_config() -> NomWatchConfig:
     if cfg is None:
         cfg = NomWatchConfig(camera=CameraConfig(ip=""))
     return cfg
-
-
-def _run_loop_pid_running() -> Optional[int]:
-    return read_pid_info(RUN_PID_PATH)[0]
-
-
-def _external_run_pids() -> list:
-    """
-    Finds `nomwatch run` processes that this UI does NOT track via its pid
-    file - e.g. one started by the launchd auto-start service or a stray
-    terminal. Without this, the dashboard would say "monitoring is NOT
-    running" while a launchd-managed loop is happily polling away, and
-    clicking Start would spin up a DUPLICATE loop (double notifications,
-    double clips). pgrep is available on both macOS and Linux.
-    """
-    tracked = _run_loop_pid_running()
-    try:
-        out = subprocess.run(
-            ["pgrep", "-f", r"nomwatch(\.cli)? run"],
-            capture_output=True, text=True, timeout=5,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return []
-    pids = []
-    for line in out.stdout.split():
-        try:
-            pid = int(line)
-        except ValueError:
-            continue
-        if pid != tracked and pid != os.getpid():
-            pids.append(pid)
-    return pids
-
-
-def _read_heartbeat() -> Optional[dict]:
-    """Returns the monitoring loop's last-poll heartbeat plus its age, or None."""
-    if not HEARTBEAT_PATH.exists():
-        return None
-    try:
-        data = json.loads(HEARTBEAT_PATH.read_text())
-        data["age_seconds"] = round(time.time() - float(data.get("ts", 0)), 1)
-        return data
-    except (ValueError, OSError):
-        return None
-
-
-def _config_changed_since(started_at: Optional[float]) -> bool:
-    """
-    True if config.yml was saved AFTER the given process start time - i.e.
-    the process is running with settings older than what the user sees in
-    the UI. This exact staleness (settings saved, nothing restarted, old
-    behavior continues silently) caused the last two real bug reports.
-    """
-    if started_at is None:
-        return False
-    try:
-        return CONFIG_PATH.stat().st_mtime > started_at
-    except OSError:
-        return False
-
-
-def _start_run_loop() -> Optional[int]:
-    """
-    Starts `nomwatch run` fresh, always restarting it if it's already
-    running. This matters because `nomwatch run` loads config ONCE at
-    startup and never reloads - if it were left running across a
-    settings change (e.g. a new local_save_dir, or new pre-roll timing),
-    it would silently keep acting on the OLD config forever with no way
-    to fix that short of manually killing the process. Restarting on every
-    explicit "Start monitoring" click guarantees the latest saved config
-    is actually the one in effect.
-    """
-    existing = _run_loop_pid_running()
-    if existing:
-        _stop_run_loop()
-        from .bridge import _wait_for_exit
-
-        _wait_for_exit(existing)
-
-    exe = shutil.which("nomwatch")
-    cmd = [exe, "run"] if exe else [sys.executable, "-m", "nomwatch.cli", "run"]
-    log_dir = CONFIG_DIR / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = open(log_dir / "run.out.log", "a")
-    try:
-        process = subprocess.Popen(
-            cmd, stdout=log_file, stderr=subprocess.STDOUT, start_new_session=True,
-            cwd=str(CONFIG_DIR),
-        )
-    except FileNotFoundError:
-        return None
-    write_pid_file(RUN_PID_PATH, process.pid)
-    return process.pid
-
-
-def _stop_run_loop() -> bool:
-    pid = _run_loop_pid_running()
-    if not pid:
-        return False
-    try:
-        os.kill(pid, 15)  # SIGTERM
-    except ProcessLookupError:
-        pass
-    RUN_PID_PATH.unlink(missing_ok=True)
-    return True
 
 
 def _read_recent_events(limit: int = 50) -> list:
