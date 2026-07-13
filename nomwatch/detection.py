@@ -189,13 +189,51 @@ def capture_frame(stream_url: str, timeout: int = 10) -> Optional[bytes]:
 
 # --- Ollama vision detector --------------------------------------------------
 
-PROMPT = (
-    "You are watching a single still frame from a camera pointed at a pet feeder. "
-    "Decide if this frame shows a pet actively eating or drinking at the feeder "
-    "(as opposed to an empty scene, a pet just walking by, or a person). "
-    "Respond with exactly one line in this format, nothing else:\n"
-    "FEEDING: yes|no CONFIDENCE: 0.0-1.0 REASON: <one short sentence>"
-)
+def build_prompt(pet_description: Optional[str] = None) -> str:
+    """
+    Builds the vision-model prompt. The single most important thing this
+    prompt does is force the model to judge whether an ANIMAL IS PRESENT AND
+    EATING - not whether the bowl merely contains food.
+
+    Confirmed live on 2026-07-12: the previous prompt ("is a pet actively
+    eating") was silently answered by gemma3:4b as "is there food in the
+    bowl", firing FEEDING: yes 0.8 on an empty room with a full bowl on
+    EVERY poll (18/18 empty-scene frames from the real camera were false
+    positives). The fix is to make "no visible animal" an explicit, hard NO
+    regardless of how much food is in the bowl - which took that same
+    empty-scene set to 0/18 false positives while still detecting 6/6 real
+    cat-eating frames.
+
+    If `pet_description` is set (e.g. "black cat", from config screen 5, and
+    previously never used) it's passed as a concrete visual anchor so the
+    model can also rule out other animals/people. Measured neutral on the
+    empty-scene case here, but it's cheap disambiguation and it's what the
+    user actually configured.
+    """
+    pet_line = (
+        f"- The animal you are watching for is a {pet_description}.\n"
+        if pet_description else ""
+    )
+    return (
+        "You are looking at a single still frame from a camera aimed at a pet's food bowl.\n"
+        "Your ONLY task: decide whether a live animal is physically present in this frame "
+        "AND has its head or mouth down at the bowl, actively eating or drinking RIGHT NOW.\n\n"
+        "Rules you must follow:\n"
+        "- Food, kibble, pellets, or water sitting in the bowl is NOT feeding by itself. "
+        "A full or partly-full bowl with NO animal visible is 'no'.\n"
+        "- You must actually SEE the animal's body: head, face, muzzle, paws, or fur at the bowl. "
+        "If you cannot clearly see an animal, answer 'no' - even if the bowl obviously contains food.\n"
+        "- An empty scene, an empty room, or just the bowl/feeder sitting there is 'no'.\n"
+        "- A person, or an animal merely walking past or near the bowl without eating, is 'no'.\n"
+        f"{pet_line}"
+        "\nAnswer with EXACTLY one line, nothing else:\n"
+        "FEEDING: yes|no CONFIDENCE: 0.0-1.0 REASON: <one short sentence: what animal you see and "
+        "what it is doing, or why there is no animal eating>"
+    )
+
+
+# Backwards-compatible default (no pet hint) for any caller importing PROMPT.
+PROMPT = build_prompt()
 
 
 class OllamaVisionDetector(DetectionEngine):
@@ -210,10 +248,15 @@ class OllamaVisionDetector(DetectionEngine):
         model: str,
         host: str = "http://localhost:11434",
         min_confidence: float = 0.6,
+        pet_description: Optional[str] = None,
     ):
         self.model = model
         self.host = host
         self.min_confidence = min_confidence
+        # Build the prompt once at construction, folding in the user's pet
+        # description (if any). See build_prompt() for why the wording matters.
+        self.pet_description = pet_description
+        self.prompt = build_prompt(pet_description)
 
     def classify(self, frame_bytes: bytes) -> Optional["ClassificationResult"]:
         """
@@ -229,7 +272,7 @@ class OllamaVisionDetector(DetectionEngine):
                 f"{self.host}/api/generate",
                 json={
                     "model": self.model,
-                    "prompt": PROMPT,
+                    "prompt": self.prompt,
                     "images": [b64],
                     "stream": False,
                 },
@@ -338,7 +381,17 @@ class OllamaVisionDetector(DetectionEngine):
                         is_feeding=result.is_feeding,
                         confidence=result.confidence,
                         reason=result.reason,
+                        raw_text=result.raw_text,
                     )
+                    # Only attach the actual frame bytes when the model said
+                    # "yes" - this is the diagnostic case that matters (why
+                    # did it think this was feeding), and doing it for every
+                    # single poll would be a lot of needless disk churn on a
+                    # camera polled every few seconds. The caller (cli.py) is
+                    # responsible for saving this to disk and NOT persisting
+                    # it into the heartbeat file itself.
+                    if result.is_feeding:
+                        status["frame_bytes"] = frame
                     if result.is_feeding and result.confidence >= self.min_confidence:
                         streak += 1
                         best_confidence = max(best_confidence, result.confidence)

@@ -332,6 +332,7 @@ def detect_test():
         model=cfg.detection.ollama_model,
         host=cfg.detection.ollama_host,
         min_confidence=cfg.detection.min_confidence,
+        pet_description=cfg.detection.pet_description,
     )
     result = detector.classify(frame)
     if result is None:
@@ -367,6 +368,7 @@ def run(once: bool):
         model=cfg.detection.ollama_model,
         host=cfg.detection.ollama_host,
         min_confidence=cfg.detection.min_confidence,
+        pet_description=cfg.detection.pet_description,
     )
 
     notifier = build_notifier(cfg.notify)
@@ -386,9 +388,21 @@ def run(once: bool):
     clips_dir = CONFIG_DIR / "clips"
 
     heartbeat_path = CONFIG_DIR / "heartbeat.json"
+    classifications_path = CONFIG_DIR / "classifications.jsonl"
+    flagged_frames_dir = CONFIG_DIR / "flagged_frames"
 
     def write_heartbeat(status: dict) -> None:
-        """Atomic write so the dashboard never reads a half-written file."""
+        """
+        Atomic write so the dashboard never reads a half-written file, PLUS
+        an append-only diagnostic log of every single classification the
+        model makes (not just confirmed events) - this is what actually
+        lets you figure out WHY a given camera/lighting setup is producing
+        false positives, instead of just knowing that it did. When the
+        model says "yes", the actual frame it was looking at is saved to
+        disk too, so you can look at exactly what it thought was feeding.
+        """
+        frame_bytes = status.pop("frame_bytes", None)
+
         payload = {
             "ts": time.time(),
             "pid": os.getpid(),
@@ -399,6 +413,34 @@ def run(once: bool):
         tmp_path = heartbeat_path.with_suffix(".json.tmp")
         tmp_path.write_text(json.dumps(payload))
         tmp_path.replace(heartbeat_path)
+
+        # Diagnostic log: every poll's raw judgment, appended forever (the
+        # user can delete/rotate this file any time - it's not required for
+        # the app to function, purely for figuring out why the model is
+        # wrong). Only meaningful polls get an entry (skip pure "ok: False"
+        # transport errors already visible in heartbeat/logs).
+        if status.get("ok"):
+            frame_path = None
+            if frame_bytes:
+                flagged_frames_dir.mkdir(parents=True, exist_ok=True)
+                frame_path = flagged_frames_dir / f"{int(payload['ts'])}.jpg"
+                frame_path.write_bytes(frame_bytes)
+                # Keep this directory from growing forever - false positives
+                # during tuning can happen every few minutes for hours.
+                existing = sorted(flagged_frames_dir.glob("*.jpg"))
+                for stale in existing[:-100]:
+                    stale.unlink(missing_ok=True)
+
+            with open(classifications_path, "a") as f:
+                f.write(json.dumps({
+                    "ts": payload["ts"],
+                    "is_feeding": status.get("is_feeding"),
+                    "confidence": status.get("confidence"),
+                    "reason": status.get("reason"),
+                    "raw_text": status.get("raw_text"),
+                    "streak": status.get("streak"),
+                    "frame_path": str(frame_path) if frame_path else None,
+                }) + "\n")
 
     log_path = CONFIG_DIR / "events.jsonl"
     click.echo(
