@@ -85,6 +85,50 @@ bridge devices - not being retired.
       HLS stream - today exposing the UI remotely requires a manual
       `tailscale serve` command
 
+## v0.7 — Detection reliability (highest priority - see below)
+The single-frame "ask a 4B vision model yes/no on one still image" approach
+in `detection.py` is not reliable enough on its own: confirmed live
+(2026-07-12) - the current setup produced confident FEEDING triggers on an
+empty room with nothing in frame. The consecutive-poll debounce only
+protects against intermittent noise; it does nothing when the model is
+consistently wrong on a given camera angle/lighting condition. This is now
+treated as the most important open problem in the project - a false
+notification (or worse, a false "upload nothing happened" silently eaten by
+debounce) undermines the entire premise of the tool. Decision, made
+2026-07-12: pursue all of the following together, not as alternatives -
+- [ ] **Motion-gating**: implement `MotionOnlyDetector` for real (currently
+      `NotImplementedError`) as a cheap frame-diff pre-filter. The vision
+      model is only ever invoked when motion against the previous frame
+      exceeds a threshold - an unchanging empty room never reaches the LLM
+      at all, which addresses the exact false-positive case found live.
+      `MotionOnlyDetector` should also be selectable as a fully standalone,
+      non-AI detection engine (`detection.engine: "motion"`) for anyone who
+      doesn't want to run a local model at all.
+- [ ] **Hybrid corroboration mode**: a new engine option where motion and
+      the vision model must BOTH agree before a streak counts toward
+      `consecutive_required` - motion alone is necessary but not
+      sufficient (also true when a pet walks past without eating), and
+      vision alone is what's currently producing empty-room false
+      positives. Requiring agreement should cut both failure directions.
+- [ ] **Zone cropping, wired for real**: screen 2's zone-detection
+      placeholder becomes a real bounding-box picker (drawn over the live
+      camera preview) whose coordinates are saved to config and used to
+      crop every frame - for both the motion-diff comparison and the image
+      sent to the vision model - to just the feeder/bowl area before
+      analysis, cutting out background the model has no business reasoning
+      about.
+- [ ] **Wire `detection.pet_description` into the real prompt** (currently
+      saved to config by screen 5 but never read by `detection.py` - see
+      the PROMPT constant). Telling the model what pet/species/color to
+      expect should reduce false positives from irrelevant motion (a
+      different animal, a person) and give it a concrete visual anchor
+      instead of an unconstrained judgment call.
+- [ ] Optional, if time allows: a setup-time calibration step - capture N
+      frames of the actual empty feeder on THIS camera and run real
+      classifications to measure this camera/model's baseline
+      false-positive rate, then suggest a `min_confidence` /
+      `consecutive_required` that would have suppressed it.
+
 ## Client/viewer architecture decision
 NomWatch always requires one real host machine (Mac, and eventually
 Linux/Windows) running the bridge (MediaMTX + detection + web UI). Phones,

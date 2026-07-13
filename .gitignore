@@ -33,3 +33,5 @@ token.json
 # MediaMTX drops auto-generated TLS certs into its CWD; NomWatch now pins
 # that to ~/.config/nomwatch, but this keeps older versions from polluting the repo
 auto.crt
+
+nomwatch-*/
