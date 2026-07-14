@@ -14,7 +14,9 @@ from typing import Optional
 
 import yaml
 
-CONFIG_DIR = Path(os.path.expanduser("~/.config/nomwatch"))
+from .paths import default_home
+
+CONFIG_DIR = default_home()
 CONFIG_PATH = CONFIG_DIR / "config.yml"
 
 
@@ -154,7 +156,8 @@ class NomWatchConfig:
 
 
 def save_config(cfg: NomWatchConfig) -> Path:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(CONFIG_DIR, stat.S_IRWXU)
     with open(CONFIG_PATH, "w") as f:
         yaml.safe_dump(asdict(cfg), f, default_flow_style=False)
     os.chmod(CONFIG_PATH, stat.S_IRUSR | stat.S_IWUSR)  # 600, owner-only

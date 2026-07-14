@@ -245,6 +245,7 @@ def _read_recent_events(limit: int = 50) -> list:
             if candidate.name and (CLIPS_DIR / candidate.name).exists():
                 clip_file = candidate.name
         event["clip_file"] = clip_file
+        event.pop("clip_path", None)
     return events
 
 
@@ -1801,7 +1802,7 @@ DASHBOARD_TEMPLATE = """\
 """
 
 
-def create_app():
+def create_app(*, state=None, auth=None):
     # Imported lazily so `pip install nomwatch` (no [ui] extra) doesn't
     # require Flask at all.
     from flask import Flask, jsonify, request, send_file
@@ -1890,7 +1891,7 @@ def create_app():
             "camera_ip": cfg.camera.ip,
             "mediamtx_reachable": mediamtx_reachable,
             "mediamtx_installed": binary_available("mediamtx"),
-            "mediamtx_url": url,
+            "mediamtx_url": "/api/v1/live/camera/index.m3u8",
             "mediamtx_stale_config": mediamtx_reachable and _config_changed_since(mtx_started),
             "monitoring_running": monitoring_alive,
             "monitoring_pid": run_pid,
@@ -1991,7 +1992,7 @@ def create_app():
             "ok": True,
             "archived": total_files,
             "bytes": total_bytes,
-            "archive_dir": str(archive_dir),
+            "archive_id": archive_dir.name,
         })
 
     @app.route("/api/recent-events")
@@ -2041,16 +2042,13 @@ def create_app():
 
     @app.route("/api/export-config")
     def api_export_config():
-        if not CONFIG_PATH.exists():
+        from .websecurity import redacted_config_payload
+        cfg = load_config()
+        if cfg is None:
             return jsonify({"ok": False, "error": "No config to export yet."}), 404
-        # Contains the camera password - fine to hand to the local user (it
-        # is their own config), and this UI is loopback/tailnet-only.
-        return send_file(
-            CONFIG_PATH,
-            mimetype="application/x-yaml",
-            as_attachment=True,
-            download_name="nomwatch-config-backup.yml",
-        )
+        response = jsonify(redacted_config_payload(cfg))
+        response.headers["Content-Disposition"] = "attachment; filename=nomwatch-settings-redacted.json"
+        return response
 
     @app.route("/api/import-config", methods=["POST"])
     def api_import_config():
@@ -2068,6 +2066,17 @@ def create_app():
             cfg = config_from_dict(raw)
         except (TypeError, ValueError) as exc:
             return jsonify({"ok": False, "error": f"Config didn't validate: {exc}"})
+        current = load_config()
+        if current is not None:
+            cfg.camera.password = current.camera.password
+            cfg.notify.pushover_app_token = current.notify.pushover_app_token
+            cfg.storage.drive_credentials_path = current.storage.drive_credentials_path
+            cfg.storage.drive_token_path = current.storage.drive_token_path
+        else:
+            cfg.camera.password = ""
+            cfg.notify.pushover_app_token = None
+            cfg.storage.drive_credentials_path = None
+            cfg.storage.drive_token_path = None
         save_config(cfg)
         write_mediamtx_config(cfg, CONFIG_DIR / "mediamtx.yml")
         return jsonify({
@@ -2095,7 +2104,7 @@ def create_app():
             ip=html.escape(cfg.camera.ip, quote=True),
             rtsp_port=cfg.camera.rtsp_port,
             username=html.escape(cfg.camera.username, quote=True),
-            password=html.escape(cfg.camera.password, quote=True),
+            password="",
             stream_path=html.escape(cfg.camera.stream_path, quote=True),
             poll_interval_seconds=cfg.detection.poll_interval_seconds,
             required_eating_seconds=cfg.detection.required_eating_seconds,
@@ -2127,7 +2136,10 @@ def create_app():
     @app.route("/api/test-camera", methods=["POST"])
     def api_test_camera():
         data = _json_body()
-        missing = [k for k in ("ip", "username", "password", "stream_path") if not str(data.get(k, "")).strip()]
+        cfg = _get_or_init_config()
+        missing = [k for k in ("ip", "username", "stream_path") if not str(data.get(k, "")).strip()]
+        if not str(data.get("password") or cfg.camera.password).strip():
+            missing.append("password")
         if missing:
             return jsonify({"ok": False, "error": f"Missing field(s): {', '.join(missing)}", "hints": []})
         try:
@@ -2139,7 +2151,7 @@ def create_app():
             ip=str(data["ip"]).strip(),
             rtsp_port=port,
             username=str(data["username"]),
-            password=str(data["password"]),
+            password=str(data.get("password") or cfg.camera.password),
             stream_path=str(data["stream_path"]).strip().strip("/"),
         ))
         frame, ffmpeg_error = capture_frame_with_error(rtsp_url(probe_cfg))
@@ -2212,7 +2224,7 @@ def create_app():
     @app.route("/api/save-camera", methods=["POST"])
     def api_save_camera():
         data = _json_body()
-        missing = [k for k in ("ip", "username", "password") if not str(data.get(k, "")).strip()]
+        missing = [k for k in ("ip", "username") if not str(data.get(k, "")).strip()]
         if missing:
             return jsonify({"ok": False, "error": f"Missing field(s): {', '.join(missing)}"})
         try:
@@ -2224,7 +2236,7 @@ def create_app():
             ip=str(data["ip"]).strip(),
             rtsp_port=port,
             username=str(data["username"]),
-            password=str(data["password"]),
+            password=str(data.get("password") or cfg.camera.password),
             stream_path=str(data.get("stream_path") or "stream1").strip().strip("/"),
         )
         save_config(cfg)
@@ -2351,7 +2363,7 @@ def create_app():
     @app.route("/api/detect-drive-sync")
     def api_detect_drive_sync():
         folder = find_google_drive_sync_folder()
-        return jsonify({"folder": str(folder) if folder else None})
+        return jsonify({"available": bool(folder)})
 
     @app.route("/api/save-storage", methods=["POST"])
     def api_save_storage():
@@ -2388,8 +2400,7 @@ def create_app():
                 )
         cfg.storage = storage_cfg
         save_config(cfg)
-        resolved = storage_cfg.local_save_dir or (str(CLIPS_DIR) if provider == "local" else None)
-        return jsonify({"ok": True, "warning": warning, "resolved_local_dir": resolved})
+        return jsonify({"ok": True, "warning": warning})
 
     # --- Screen 4: notifications ---------------------------------------------
 
@@ -2434,6 +2445,15 @@ def create_app():
         save_config(cfg)
         return jsonify({"ok": True})
 
+    if state is None:
+        from .paths import NomWatchPaths
+        from .state import LocalState
+        state = LocalState(NomWatchPaths.from_environment())
+    if auth is None:
+        from .auth import AuthService
+        auth = AuthService(state)
+    from .websecurity import init_security
+    init_security(app, auth)
     return app
 
 
