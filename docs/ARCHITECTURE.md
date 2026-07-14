@@ -1,5 +1,11 @@
 # Architecture & Security Model
 
+> **Local-first host direction (2026-07-14):**
+> [`ADR 0001`](adr/0001-local-first-host-and-private-remote-access.md)
+> defines the proposed authenticated LAN baseline, private Tailscale Serve
+> integration, local account/data model, and complete host service lifecycle.
+> Where it differs from this older overview, ADR 0001 is the current proposal.
+
 ## Threat model / design goals
 
 NomWatch's entire reason for existing is that pet feeder cams currently force a choice between "pay a subscription and trust a vendor's cloud with home video" or "no smart features at all." We reject both defaults:
