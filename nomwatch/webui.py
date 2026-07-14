@@ -1796,7 +1796,9 @@ DASHBOARD_TEMPLATE = """\
 """
 
 
-def create_app(*, state=None, auth=None, supervisor=None, network_manager=None, gateway_http_get=None):
+def create_app(*, state=None, auth=None, supervisor=None, network_manager=None,
+               tailscale_adapter=None, allowed_hosts_provider=None,
+               listener_policy=None, gateway_http_get=None):
     # Imported lazily so `pip install nomwatch` (no [ui] extra) doesn't
     # require Flask at all.
     from flask import Flask, jsonify, request, send_file
@@ -2470,9 +2472,11 @@ def create_app(*, state=None, auth=None, supervisor=None, network_manager=None, 
         auth = AuthService(state)
     from .gateway import init_gateway_routes
     gateway_kwargs = {"http_get": gateway_http_get} if gateway_http_get is not None else {}
-    init_gateway_routes(app, state, auth, network_manager, **gateway_kwargs)
+    init_gateway_routes(app, state, auth, network_manager, tailscale_adapter,
+                        allowed_hosts=allowed_hosts_provider, **gateway_kwargs)
     from .websecurity import init_security
-    init_security(app, auth, allowed_hosts=network_manager.allowed_hosts if network_manager else None)
+    hosts = allowed_hosts_provider or (network_manager.allowed_hosts if network_manager else None)
+    init_security(app, auth, allowed_hosts=hosts, listener_policy=listener_policy)
     return app
 
 

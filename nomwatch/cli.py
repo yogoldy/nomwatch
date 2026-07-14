@@ -288,6 +288,16 @@ def service_status():
 @main.command()
 def service_uninstall():
     """Remove the launchd auto-start service (does not affect any config/data)."""
+    from .paths import NomWatchPaths
+    from .state import LocalState
+    state = LocalState(NomWatchPaths.from_environment())
+    with state.connect() as conn:
+        remote = conn.execute("SELECT desired_enabled,status FROM remote_access WHERE id=1").fetchone()
+    if remote and (remote["desired_enabled"] or remote["status"] == "cleanup_required"):
+        raise click.ClickException(
+            "Remote Access still owns or may require cleanup of a Tailscale Serve mapping; "
+            "disable/diagnose it before uninstalling the host service."
+        )
     error = uninstall_launchd_service()
     click.echo(error or "Removed.")
 

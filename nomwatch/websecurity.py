@@ -37,7 +37,7 @@ def _payload(request) -> dict:
     return request.get_json(silent=True) or request.form.to_dict()
 
 
-def init_security(app, auth: AuthService, *, allowed_hosts=None) -> None:
+def init_security(app, auth: AuthService, *, allowed_hosts=None, listener_policy=None) -> None:
     from flask import g, jsonify, make_response, redirect, request
 
     app.extensions["nomwatch_auth"] = auth
@@ -54,6 +54,8 @@ def init_security(app, auth: AuthService, *, allowed_hosts=None) -> None:
     def request_origin_class() -> str:
         host = request.host.lower()
         hostname = host[1:host.index("]")] if host.startswith("[") and "]" in host else host.split(":", 1)[0]
+        if hostname.endswith(".ts.net"):
+            return "tailscale"
         return "loopback" if hostname in {"localhost", "127.0.0.1", "::1"} else "lan"
 
     @app.before_request
@@ -64,6 +66,8 @@ def init_security(app, auth: AuthService, *, allowed_hosts=None) -> None:
         permitted = allowed_hosts() if allowed_hosts else {"localhost", "127.0.0.1", "::1"}
         if host not in permitted:
             return error("Host is not an active NomWatch listener", 400)
+        if listener_policy and not listener_policy(host, request.environ.get("SERVER_PORT", "")):
+            return error("Host is not valid for this listener", 400)
 
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             origin = request.headers.get("Origin")
@@ -136,8 +140,9 @@ def init_security(app, auth: AuthService, *, allowed_hosts=None) -> None:
 
     def issue_response(issued, status=200):
         response = make_response(jsonify({"ok": True}), status)
-        response.set_cookie(SESSION_COOKIE, issued.token, httponly=True, samesite="Lax", secure=False, max_age=7 * 86400)
-        response.set_cookie(CSRF_COOKIE, issued.csrf, httponly=False, samesite="Lax", secure=False, max_age=7 * 86400)
+        secure = request_origin_class() == "tailscale"
+        response.set_cookie(SESSION_COOKIE, issued.token, httponly=True, samesite="Lax", secure=secure, max_age=7 * 86400)
+        response.set_cookie(CSRF_COOKIE, issued.csrf, httponly=False, samesite="Lax", secure=secure, max_age=7 * 86400)
         return response
 
     @app.post("/api/v1/auth/claim")

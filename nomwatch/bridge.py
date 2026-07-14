@@ -308,10 +308,9 @@ def enable_tailscale_serve(hls_port: int) -> subprocess.CompletedProcess:
     Deliberately uses `serve`, never `funnel` - funnel makes it public,
     which defeats the entire point of this project.
     """
-    return subprocess.run(
-        ["tailscale", "serve", "--bg", f"http://127.0.0.1:{hls_port}"],
-        capture_output=True,
-        text=True,
+    raise RuntimeError(
+        "Direct MediaMTX publication is prohibited. Use the authenticated NomWatch "
+        "Remote Access integration, which owns one private gateway mapping."
     )
 
 

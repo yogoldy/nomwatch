@@ -218,6 +218,15 @@ class AuthService:
         self.state.audit("session.revoke", "success" if cur.rowcount else "not_found", actor=actor_id, object_id=session_id)
         return bool(cur.rowcount)
 
+    def revoke_origin(self, origin_class: str) -> int:
+        with self.state.connect() as conn:
+            cur = conn.execute(
+                "UPDATE sessions SET revoked_at=? WHERE origin_class=? AND revoked_at IS NULL",
+                (self.clock(), origin_class),
+            )
+        self.state.audit("session.revoke_origin", "success", source="local", detail={"origin_class": origin_class, "count": cur.rowcount})
+        return cur.rowcount
+
     def reauthenticate(self, session_id: str, password: str) -> None:
         with self.state.connect() as conn:
             row = conn.execute("SELECT s.user_id,u.password_hash FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.id=?", (session_id,)).fetchone()
