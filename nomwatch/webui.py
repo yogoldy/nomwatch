@@ -88,6 +88,7 @@ from .service import (
     uninstall_launchd_service,
 )
 from .storage import find_google_drive_sync_folder
+from . import monitorlock
 
 # --- "Start monitoring right now" process management -----------------------
 # Separate from the optional launchd auto-start-on-login service (see
@@ -184,7 +185,13 @@ def _start_run_loop() -> Optional[int]:
         _stop_run_loop()
         from .bridge import _wait_for_exit
 
-        _wait_for_exit(existing)
+        if not _wait_for_exit(existing):
+            return None
+
+    # ``pgrep`` is useful status information but is unavailable in some
+    # sandboxed macOS contexts. The monitor-owned lock is authoritative.
+    if monitorlock.run_loop_locked():
+        return None
 
     exe = shutil.which("nomwatch")
     cmd = [exe, "run"] if exe else [sys.executable, "-m", "nomwatch.cli", "run"]
@@ -1874,7 +1881,7 @@ def create_app():
         heartbeat = _read_heartbeat()
         # A heartbeat is only meaningful while some monitoring process is
         # alive - otherwise it's the corpse of the last run.
-        monitoring_alive = run_pid is not None or bool(external_pids)
+        monitoring_alive = run_pid is not None or bool(external_pids) or monitorlock.run_loop_locked()
         if heartbeat is not None and not monitoring_alive:
             heartbeat = None
 
@@ -1918,13 +1925,14 @@ def create_app():
                 "error": "No vision model is picked yet - finish detection setup, or choose the motion-only engine.",
             })
         external = _external_run_pids()
-        if external:
+        untracked_monitor = _run_loop_pid_running() is None and monitorlock.run_loop_locked()
+        if external or untracked_monitor:
             return jsonify({
                 "ok": False,
                 "pid": None,
                 "error": (
                     f"A monitoring process this UI doesn't manage is already running "
-                    f"(pid {external[0]}) - probably the auto-start service installed by "
+                    f"({f'pid {external[0]}' if external else 'detected by its monitor lock'}) - probably the auto-start service installed by "
                     "`nomwatch setup`, or a `nomwatch run` left in a terminal. Starting a "
                     "second one would double every notification and clip. Stop that one "
                     "first (`nomwatch service-uninstall`, or Ctrl+C in its terminal)."

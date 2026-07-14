@@ -531,6 +531,7 @@ def poll_stream(
     zone: Optional[Zone] = None,
     interval_seconds: int = 10,
     consecutive_required: int = 2,
+    rearm_after_negative_polls: int = 3,
     on_poll=None,
 ):
     """
@@ -551,6 +552,11 @@ def poll_stream(
       a static frame (the residual hallucination the fixed prompt can still
       occasionally produce) is suppressed because nothing moved.
 
+    After an event fires, it remains part of the same visit until
+    `rearm_after_negative_polls` negative polls occur in a row. This prevents
+    one model false negative from splitting an ongoing meal into multiple
+    notifications and clips.
+
     Every frame is optionally cropped to `zone` FIRST, so both the motion diff
     and the image sent to the model see only the bowl area.
 
@@ -561,6 +567,7 @@ def poll_stream(
     """
     streak = 0
     already_fired = False
+    negative_polls_since_event = 0
     best_confidence = 0.0
     best_reason = ""
     prev_thumb: Optional[bytes] = None
@@ -655,6 +662,13 @@ def poll_stream(
 
         # --- debounce / streak ---
         if positive:
+            negative_polls_since_event = 0
+            if already_fired:
+                # This is still the same visit. Do not let a prior isolated
+                # negative re-arm the detector and create a second alert.
+                emit(status, streak)
+                time.sleep(interval_seconds)
+                continue
             streak += 1
             best_confidence = max(best_confidence, status.get("confidence") or 0.0)
             best_reason = status.get("reason") or best_reason
@@ -669,6 +683,12 @@ def poll_stream(
                 time.sleep(interval_seconds)
                 continue
         else:
+            if already_fired:
+                negative_polls_since_event += 1
+                if negative_polls_since_event < max(1, rearm_after_negative_polls):
+                    emit(status, streak)
+                    time.sleep(interval_seconds)
+                    continue
             streak = 0
             already_fired = False
             best_confidence = 0.0

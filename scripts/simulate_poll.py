@@ -3,7 +3,8 @@
 Simulates poll_stream()'s debounce logic against a scripted sequence of
 fake classification results - no camera, no Ollama, no real time delay.
 Useful for verifying "requires N consecutive positives, fires once per
-streak, resets on a negative" without staging a real feeding event.
+visit, and only re-arms after several negatives" without staging a real
+feeding event.
 
 Usage:
     python3 scripts/simulate_poll.py
@@ -17,7 +18,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from nomwatch.detection import ClassificationResult, OllamaVisionDetector
+from nomwatch.detection import ClassificationResult, OllamaVisionDetector, poll_stream
 
 # Scripted sequence of poll results: (is_feeding, confidence, reason)
 # Mirrors a realistic session: idle -> cat approaches (ambiguous) -> real
@@ -31,8 +32,9 @@ SCRIPT = [
     (True, 0.9, "cat is eating"),              # streak = 2 -> should fire here (consecutive_required=2)
     (True, 0.88, "cat is still eating"),       # streak continues, must NOT fire again
     (True, 0.82, "cat is still eating"),
-    (False, 0.2, "cat finished, walked off"),  # streak resets
+    (False, 0.2, "cat finished, walked off"),
     (False, 0.15, "empty bowl"),
+    (False, 0.15, "empty bowl"),              # 3 negatives -> re-arm
     (True, 0.7, "cat is back eating again"),   # new streak starts
     (True, 0.75, "cat is back eating again"),  # streak = 2 -> should fire a SECOND event
 ]
@@ -55,7 +57,14 @@ def main():
          patch("time.sleep", return_value=None):
 
         events = []
-        gen = detector.poll_stream("rtsp://fake", interval_seconds=10, consecutive_required=2)
+        gen = poll_stream(
+            "rtsp://fake",
+            detector=detector,
+            motion_gating=False,
+            interval_seconds=10,
+            consecutive_required=2,
+            rearm_after_negative_polls=3,
+        )
         for _ in range(len(SCRIPT) + 2):  # a couple extra ticks past the script, harmless
             event = next(gen)
             events.append(event)

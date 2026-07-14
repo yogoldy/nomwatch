@@ -72,6 +72,11 @@ class DetectionConfig:
     # Guards against a single hallucinated/ambiguous frame firing a false alert.
     consecutive_required: int = 2
     required_eating_seconds: int = 20
+    # After an event fires, require this many consecutive negative polls
+    # before re-arming. A single bad frame must not split one continuous
+    # visit into duplicate notifications/clips. At the default 10-second
+    # interval, 3 means the cat must be absent for about 30 seconds.
+    rearm_after_negative_polls: int = 3
     # Clip window around a confirmed event: `pre_roll_seconds` before the
     # first positive poll in the streak, `clip_post_confirm_seconds` after
     # confirmation. Pre-roll requires continuous local recording (see

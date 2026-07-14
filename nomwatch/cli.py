@@ -41,6 +41,7 @@ from .detection import (
     pull_model,
 )
 from .notify import build_notifier
+from . import monitorlock
 from .service import (
     install_launchd_service,
     launchd_service_status,
@@ -421,6 +422,15 @@ def run(once: bool):
         )
         return
 
+    # This lock belongs to the monitoring process, not a particular UI. It
+    # prevents a menu-bar app, web UI, terminal, or auto-start service from
+    # running duplicate loops against the same camera.
+    run_lock = monitorlock.run_loop_lock()
+    if not run_lock.__enter__():
+        run_lock.__exit__(None, None, None)
+        click.echo("Monitoring is already running elsewhere; refusing to start a duplicate loop.")
+        return
+
     stream_url = rtsp_url(cfg)
 
     # The vision model is only needed for the ollama/hybrid engines.
@@ -532,18 +542,19 @@ def run(once: bool):
         "(Ctrl+C to stop)\n"
     )
 
-    events = poll_stream(
-        stream_url,
-        engine=engine,
-        detector=detector,
-        motion=motion,
-        motion_gating=cfg.detection.motion_gating,
-        zone=zone,
-        interval_seconds=cfg.detection.poll_interval_seconds,
-        consecutive_required=cfg.detection.consecutive_required,
-        on_poll=write_heartbeat,
-    )
     try:
+        events = poll_stream(
+            stream_url,
+            engine=engine,
+            detector=detector,
+            motion=motion,
+            motion_gating=cfg.detection.motion_gating,
+            zone=zone,
+            interval_seconds=cfg.detection.poll_interval_seconds,
+            consecutive_required=cfg.detection.consecutive_required,
+            rearm_after_negative_polls=cfg.detection.rearm_after_negative_polls,
+            on_poll=write_heartbeat,
+        )
         for event in events:
             ts = datetime.datetime.fromtimestamp(event.timestamp).strftime("%Y-%m-%d %H:%M:%S")
             click.echo(f"🐾 [{ts}] Feeding event confirmed - confidence {event.confidence:.2f}: {event.reasoning}")
@@ -670,6 +681,8 @@ def run(once: bool):
                 break
     except KeyboardInterrupt:
         click.echo("\nStopped.")
+    finally:
+        run_lock.__exit__(None, None, None)
 
 
 @main.command()
