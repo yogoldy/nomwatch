@@ -1802,12 +1802,14 @@ DASHBOARD_TEMPLATE = """\
 """
 
 
-def create_app(*, state=None, auth=None):
+def create_app(*, state=None, auth=None, supervisor=None):
     # Imported lazily so `pip install nomwatch` (no [ui] extra) doesn't
     # require Flask at all.
     from flask import Flask, jsonify, request, send_file
 
     app = Flask(__name__)
+    if supervisor is not None:
+        app.extensions["nomwatch_supervisor"] = supervisor
 
     @app.errorhandler(Exception)
     def _api_errors_as_json(exc):
@@ -1886,6 +1888,11 @@ def create_app(*, state=None, auth=None):
         if heartbeat is not None and not monitoring_alive:
             heartbeat = None
 
+        host_health = supervisor.health() if supervisor is not None else None
+        if host_health is not None:
+            monitor = host_health["children"].get("monitor", {})
+            monitoring_alive = monitor.get("status") in {"starting", "ready"}
+            run_pid = monitor.get("pid")
         return jsonify({
             "configured": bool(cfg.camera.ip),
             "camera_ip": cfg.camera.ip,
@@ -1907,10 +1914,14 @@ def create_app(*, state=None, auth=None):
             "notify_provider": cfg.notify.provider,
             "ntfy_topic": cfg.notify.ntfy_topic,
             "storage_provider": cfg.storage.provider,
+            "host": host_health,
         })
 
     @app.route("/api/start-monitoring", methods=["POST"])
     def api_start_monitoring():
+        if supervisor is not None:
+            result = supervisor.set_monitoring(True)
+            return jsonify(result), (200 if result.get("ok") else 503)
         cfg = _get_or_init_config()
         engine = cfg.detection.engine
         if engine not in ("ollama", "motion", "hybrid"):
@@ -1946,6 +1957,8 @@ def create_app(*, state=None, auth=None):
 
     @app.route("/api/stop-monitoring", methods=["POST"])
     def api_stop_monitoring():
+        if supervisor is not None:
+            return jsonify(supervisor.set_monitoring(False))
         stopped = _stop_run_loop()
         return jsonify({"ok": stopped})
 

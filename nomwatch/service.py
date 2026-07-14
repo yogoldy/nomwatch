@@ -1,11 +1,4 @@
-"""
-Auto-start service wiring so `nomwatch run` survives reboots/logouts without
-anyone needing to leave a terminal open.
-
-macOS: generates and loads a launchd user agent (~/Library/LaunchAgents).
-Linux: generates a systemd --user unit (not yet wired into the CLI - stub
-below, tracked in docs/ROADMAP.md).
-"""
+"""Exact platform service definitions for the one foreground host."""
 from __future__ import annotations
 
 import os
@@ -17,7 +10,8 @@ from pathlib import Path
 from typing import List, Optional
 from xml.sax.saxutils import escape as _xml_escape
 
-LAUNCHD_LABEL = "com.nomwatch.run"
+LAUNCHD_LABEL = "com.nomwatch.host"
+LEGACY_LAUNCHD_LABEL = "com.nomwatch.run"
 
 
 def _service_path() -> str:
@@ -52,7 +46,7 @@ def _launchd_plist_path() -> Path:
 
 def _nomwatch_command() -> List[str]:
     """
-    The argv to launch `nomwatch run`, as a proper list so each element stays
+    The argv to launch `nomwatch host`, as a proper list so each element stays
     intact even when a path contains spaces (e.g. a venv under a directory
     like 'Documents (local)' - splitting the string on whitespace produced a
     broken plist that launchd couldn't run). Prefers the installed console
@@ -60,8 +54,8 @@ def _nomwatch_command() -> List[str]:
     """
     found = shutil.which("nomwatch")
     if found:
-        return [found, "run"]
-    return [sys.executable, "-m", "nomwatch.cli", "run"]
+        return [found, "host"]
+    return [sys.executable, "-m", "nomwatch.cli", "host"]
 
 
 def render_launchd_plist(log_dir: Path) -> str:
@@ -114,11 +108,11 @@ def install_launchd_service(log_dir: Path) -> Optional[str]:
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     plist_path.write_text(render_launchd_plist(log_dir))
 
-    # Unload first in case a previous version is already loaded, then load fresh.
-    subprocess.run(["launchctl", "unload", str(plist_path)], capture_output=True)
-    result = subprocess.run(["launchctl", "load", "-w", str(plist_path)], capture_output=True, text=True)
+    domain = f"gui/{os.getuid()}"
+    subprocess.run(["launchctl", "bootout", domain, str(plist_path)], capture_output=True)
+    result = subprocess.run(["launchctl", "bootstrap", domain, str(plist_path)], capture_output=True, text=True)
     if result.returncode != 0:
-        return f"launchctl load failed: {result.stderr.strip() or result.stdout.strip()}"
+        return f"launchctl bootstrap failed: {result.stderr.strip() or result.stdout.strip()}"
     return None
 
 
@@ -130,7 +124,7 @@ def uninstall_launchd_service() -> Optional[str]:
     if not plist_path.exists():
         return "No NomWatch launchd service found."
 
-    subprocess.run(["launchctl", "unload", str(plist_path)], capture_output=True)
+    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(plist_path)], capture_output=True)
     plist_path.unlink()
     return None
 
@@ -147,3 +141,37 @@ def launchd_service_status() -> str:
     if result.returncode == 0:
         return f"Installed and loaded:\n{result.stdout}"
     return "Plist exists but not currently loaded (may need `launchctl load` again)."
+
+
+def render_systemd_unit(executable: str = "/usr/bin/nomwatch") -> str:
+    """System service for Raspberry Pi OS; package installation owns the paths/user."""
+    return f"""[Unit]
+Description=NomWatch local-first host
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nomwatch
+Group=nomwatch
+ExecStart={executable} host
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+KillMode=control-group
+UMask=0077
+StateDirectory=nomwatch
+RuntimeDirectory=nomwatch
+Environment=NOMWATCH_HOME=/var/lib/nomwatch
+Environment=NOMWATCH_RUNTIME_DIR=/run/nomwatch
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/nomwatch /run/nomwatch
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
+"""

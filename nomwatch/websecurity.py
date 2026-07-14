@@ -13,7 +13,7 @@ ANONYMOUS_PATHS = {
 }
 LOCAL_ONLY_PATHS = {
     "/api/install-service", "/api/uninstall-service", "/api/install-ffmpeg",
-    "/api/install-mediamtx", "/api/pull-model",
+    "/api/install-mediamtx", "/api/start-mediamtx", "/api/pull-model",
 }
 OPERATOR_MUTATIONS = {
     "/api/start-monitoring", "/api/stop-monitoring", "/api/test-notify",

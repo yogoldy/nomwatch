@@ -237,6 +237,82 @@ class LocalState:
                 (actor, action, object_id, result, source, self.clock(), json.dumps(safe, sort_keys=True)),
             )
 
+    def persist_event_with_job(self, *, timestamp: float, confidence: float, reason: str,
+                               payload: dict[str, Any], run_at: Optional[float] = None) -> str:
+        """Persist the event before atomically creating its idempotent outbox job."""
+        event_id = uuid.uuid4().hex
+        job_id = uuid.uuid4().hex
+        now = self.clock()
+        with self.transaction(immediate=True) as conn:
+            camera = conn.execute("SELECT id FROM cameras ORDER BY id LIMIT 1").fetchone()
+            conn.execute(
+                "INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (event_id, None, camera[0] if camera else None, timestamp, confidence,
+                 reason[:1000], "pending", None, now, now),
+            )
+            body = dict(payload)
+            body["event_id"] = event_id
+            conn.execute(
+                "INSERT INTO jobs VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (job_id, "finalize_event", json.dumps(body, sort_keys=True), "pending", 0,
+                 run_at if run_at is not None else now, f"finalize:{event_id}", None, now, now),
+            )
+        return event_id
+
+    def claim_job(self) -> Optional[dict[str, Any]]:
+        now = self.clock()
+        with self.transaction(immediate=True) as conn:
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE status IN ('pending','retry') AND next_run_at<=? ORDER BY next_run_at,id LIMIT 1",
+                (now,),
+            ).fetchone()
+            if not row:
+                return None
+            conn.execute(
+                "UPDATE jobs SET status='running',attempts=attempts+1,updated_at=? WHERE id=? AND status IN ('pending','retry')",
+                (now, row["id"]),
+            )
+            claimed = dict(row)
+            claimed["attempts"] += 1
+            return claimed
+
+    def finish_job(self, job_id: str, *, event_id: Optional[str] = None) -> None:
+        now = self.clock()
+        with self.transaction(immediate=True) as conn:
+            conn.execute("UPDATE jobs SET status='complete',updated_at=? WHERE id=?", (now, job_id))
+            if event_id:
+                conn.execute("UPDATE events SET status='complete',updated_at=? WHERE id=?", (now, event_id))
+
+    def retry_job(self, job_id: str, error: str, attempts: int, *, event_id: Optional[str] = None) -> None:
+        now = self.clock()
+        terminal = attempts >= 5
+        with self.transaction(immediate=True) as conn:
+            conn.execute(
+                "UPDATE jobs SET status=?,next_run_at=?,terminal_error=?,updated_at=? WHERE id=?",
+                ("failed" if terminal else "retry", now + min(300, 2 ** attempts), error[:1000], now, job_id),
+            )
+            if event_id:
+                conn.execute(
+                    "UPDATE events SET status=?,error_summary=?,updated_at=? WHERE id=?",
+                    ("failed" if terminal else "pending", error[:1000], now, event_id),
+                )
+
+    def add_media(self, event_id: str, path: Path, kind: str = "clip") -> str:
+        resolved = path.resolve()
+        try:
+            relative = resolved.relative_to(self.paths.home.resolve())
+        except ValueError as exc:
+            raise StateError("media must live under NOMWATCH_HOME") from exc
+        media_id = uuid.uuid4().hex
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO media_files VALUES (?,?,?,?,?,?,?,?,?)",
+                (media_id, event_id, kind, str(relative), "video/mp4", path.stat().st_size,
+                 digest, "active", self.clock()),
+            )
+        return media_id
+
     def import_legacy_shadow(self, config_path: Path, events_path: Path) -> dict[str, int]:
         """Idempotently imports copies of legacy data; callers must quiesce before real cutover."""
         imported_settings = imported_events = 0

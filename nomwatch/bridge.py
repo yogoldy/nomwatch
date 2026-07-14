@@ -39,6 +39,13 @@ def rtsp_url(cfg: NomWatchConfig) -> str:
 MEDIAMTX_CONFIG_TEMPLATE = """\
 rtspAddress: 127.0.0.1:{rtsp_port}
 hlsAddress: 127.0.0.1:{hls_port}
+authMethod: internal
+authInternalUsers:
+- user: {read_user}
+  pass: {read_password}
+  permissions:
+  - action: read
+    path: cam
 webrtc: false
 rtmp: false
 srt: false
@@ -67,7 +74,18 @@ RECORDING_BLOCK_TEMPLATE = """\
 # test file wouldn't have caught this.
 
 
-def render_mediamtx_config(cfg: NomWatchConfig) -> str:
+def _internal_media_credentials() -> tuple[str, str]:
+    user = os.environ.get("NOMWATCH_MEDIAMTX_READ_USER", "nomwatch")
+    password = os.environ.get("NOMWATCH_MEDIAMTX_READ_PASSWORD")
+    if not password:
+        # Config generation outside the host is development-only. The host
+        # always injects an installation-scoped random value.
+        password = "development-loopback-only"
+    return user, password
+
+
+def render_mediamtx_config(cfg: NomWatchConfig, *, read_user: Optional[str] = None,
+                           read_password: Optional[str] = None) -> str:
     recording_block = ""
     if cfg.detection.pre_roll_seconds > 0:
         recordings_dir = clean_user_path(cfg.bridge.recordings_dir) or str(CONFIG_DIR / "recordings")
@@ -82,11 +100,23 @@ def render_mediamtx_config(cfg: NomWatchConfig) -> str:
             ),
         )
 
+    default_user, default_password = _internal_media_credentials()
     return MEDIAMTX_CONFIG_TEMPLATE.format(
         rtsp_port=cfg.bridge.mediamtx_rtsp_port,
         hls_port=cfg.bridge.mediamtx_hls_port,
         source_url=rtsp_url(cfg),
+        read_user=read_user or default_user,
+        read_password=read_password or default_password,
         recording_block=recording_block,
+    )
+
+
+def local_mediamtx_rtsp_url(cfg: NomWatchConfig) -> str:
+    """Credential-bearing loopback URL passed only through the child environment."""
+    user, password = _internal_media_credentials()
+    return (
+        f"rtsp://{urllib.parse.quote(user, safe='')}:{urllib.parse.quote(password, safe='')}"
+        f"@127.0.0.1:{cfg.bridge.mediamtx_rtsp_port}/cam"
     )
 
 
@@ -262,8 +292,9 @@ def stop_mediamtx() -> bool:
     return True
 
 
-def write_mediamtx_config(cfg: NomWatchConfig, path: Path) -> Path:
-    path.write_text(render_mediamtx_config(cfg))
+def write_mediamtx_config(cfg: NomWatchConfig, path: Path, *, read_user: Optional[str] = None,
+                          read_password: Optional[str] = None) -> Path:
+    path.write_text(render_mediamtx_config(cfg, read_user=read_user, read_password=read_password))
     # The rendered config embeds the camera's RTSP credentials in plaintext -
     # it must be owner-only, same as config.yml (was previously left at the
     # default 644, world-readable).
