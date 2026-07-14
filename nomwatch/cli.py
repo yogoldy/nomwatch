@@ -753,6 +753,57 @@ def host(port: int):
 
 
 @main.command()
+def backup():
+    """Create a verified local operational SQLite backup (no media/secrets)."""
+    from .paths import NomWatchPaths
+    from .recovery import create_operational_backup
+    from .state import LocalState
+    location = create_operational_backup(LocalState(NomWatchPaths.from_environment()))
+    click.echo(f"Verified operational backup created: {location}")
+
+
+@main.command("restore-backup")
+@click.argument("backup_dir", type=click.Path(path_type=Path, exists=True, file_okay=False))
+@click.option("--yes", "confirmed", is_flag=True, help="Confirm offline database replacement.")
+def restore_backup(backup_dir: Path, confirmed: bool):
+    """Restore a verified operational backup while the host is stopped."""
+    if not confirmed:
+        raise click.ClickException("restore requires --yes and a stopped NomWatch host")
+    from .paths import NomWatchPaths
+    from .recovery import restore_operational_backup
+    rollback = restore_operational_backup(NomWatchPaths.from_environment(), backup_dir)
+    click.echo(f"Database restored. Previous database preserved under: {rollback}")
+
+
+@main.command()
+@click.option("--json-output", is_flag=True, help="Emit machine-readable JSON.")
+def diagnose(json_output: bool):
+    """Run local recovery, permissions, disk, migration, and cleanup checks."""
+    from .paths import NomWatchPaths
+    from .recovery import diagnostics
+    report = diagnostics(NomWatchPaths.from_environment())
+    if json_output:
+        click.echo(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        click.echo(f"NomWatch recovery status: {report['status']}")
+        for key, value in report.items():
+            if key != "status":
+                click.echo(f"  {key}: {value}")
+
+
+@main.command(hidden=True)
+def maintenance():
+    """Run bounded host state compaction and migration-snapshot retention."""
+    from .paths import NomWatchPaths
+    from .recovery import compact_state, prune_migration_backups
+    from .state import LocalState
+    paths = NomWatchPaths.from_environment()
+    result = compact_state(LocalState(paths))
+    result["migration_backups_removed"] = prune_migration_backups(paths)
+    click.echo(json.dumps(result, sort_keys=True))
+
+
+@main.command()
 @click.option("--port", default=None, type=int, help="Explicit loopback development server port.")
 def ui(port: int | None):
     """Report the supervised host URL, or run an explicit loopback dev UI."""

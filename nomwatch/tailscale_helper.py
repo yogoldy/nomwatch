@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import pwd
+import grp
 import socket
 import socketserver
 import struct
@@ -70,3 +71,18 @@ def helper_request(path: Path, operation: str, timeout: float = 135.0) -> Helper
         client.sendall((json.dumps({"version": PROTOCOL_VERSION, "operation": operation}) + "\n").encode())
         response = json.loads(client.makefile("rb").readline(65537))
     return HelperResult(int(response["returncode"]), str(response.get("stdout", "")), str(response.get("stderr", "")))
+
+
+def main() -> None:
+    if os.geteuid() != 0:
+        raise SystemExit("nomwatch-tailscale-helper must run as root under its systemd unit")
+    path = Path("/run/nomwatch/tailscale-helper.sock")
+    server = TailscaleHelperServer(path)
+    group = grp.getgrnam("nomwatch").gr_gid
+    os.chown(path, 0, group)
+    os.chmod(path, 0o660)
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+        path.unlink(missing_ok=True)

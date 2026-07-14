@@ -24,7 +24,7 @@ Any LAN camera with RTSP (ONVIF optional, for future motion-event hooks). No clo
 Any always-on machine on the same LAN as the camera: old laptop, Raspberry Pi, Mac mini, NAS with Docker. Runs:
 
 - **MediaMTX** (or go2rtc): pulls the RTSP stream and re-serves it as HLS. Bound to `127.0.0.1` only — never the LAN interface, never `0.0.0.0`. WebRTC output is disabled by default because ICE negotiation can advertise local network interfaces to a client, which is a real leak vector for a "LAN-invisible" design; HLS is plain HTTP/TCP and can't escape a loopback bind.
-- **Tailscale**: joins the user's private tailnet. `tailscale serve` publishes the loopback HLS endpoint at `https://<device>.<tailnet>.ts.net` — TLS-terminated automatically by Tailscale's cert issuance, reachable only by devices authenticated into that same tailnet. **`tailscale funnel` is never used** — funnel makes an endpoint public, which is exactly what this project exists to avoid.
+- **Tailscale**: remains an independently installed private-tailnet service. NomWatch's narrow adapter can own one verified private `tailscale serve` mapping to a dedicated authenticated loopback gateway. Live HLS stays behind NomWatch login and same-origin authorization. **`tailscale funnel` is never used** — funnel makes an endpoint public, which is exactly what this project exists to avoid.
 - **Detection + notification + upload** (see below) also run here, so raw video never needs to leave this device except as short clips deliberately uploaded to the user's own cloud storage.
 
 ### 3. Detection engine (pluggable)

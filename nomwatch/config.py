@@ -7,7 +7,11 @@ Never committed to git, never logged, never sent anywhere.
 from __future__ import annotations
 
 import os
+import json
+import contextlib
+import sqlite3
 import stat
+import uuid
 from dataclasses import dataclass, asdict, field, fields
 from pathlib import Path
 from typing import Optional
@@ -156,6 +160,51 @@ class NomWatchConfig:
 
 
 def save_config(cfg: NomWatchConfig) -> Path:
+    database = CONFIG_DIR / "nomwatch.sqlite3"
+    if database.exists():
+        from .paths import NomWatchPaths
+        from .state import LocalState
+        state = LocalState(NomWatchPaths(CONFIG_DIR))
+        with state.connect() as conn:
+            existing = conn.execute("SELECT id,password_secret_ref FROM cameras ORDER BY id LIMIT 1").fetchone()
+        camera_id = existing["id"] if existing else uuid.uuid4().hex
+        password_ref = existing["password_secret_ref"] if existing else None
+        if cfg.camera.password and (not password_ref or state.get_secret(password_ref) != cfg.camera.password):
+            password_ref = state.put_secret("camera_password", cfg.camera.password)
+        with state.transaction(immediate=True) as conn:
+            if existing:
+                conn.execute(
+                    "UPDATE cameras SET display_name='Camera',host=?,port=?,stream_path=?,username=?,password_secret_ref=?,revision=revision+1 WHERE id=?",
+                    (cfg.camera.ip, cfg.camera.rtsp_port, cfg.camera.stream_path, cfg.camera.username, password_ref, camera_id),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO cameras VALUES (?,?,?,?,?,?,?,?,1)",
+                    (camera_id, "Camera", cfg.camera.ip, cfg.camera.rtsp_port, cfg.camera.stream_path,
+                     cfg.camera.username, password_ref, 1),
+                )
+        with state.connect() as conn:
+            current_settings = {row["namespace"]: json.loads(row["value_json"])
+                                for row in conn.execute("SELECT namespace,value_json FROM settings")}
+        for namespace in ("bridge", "detection", "notify", "storage"):
+            value = asdict(getattr(cfg, namespace))
+            if namespace == "notify":
+                secret_value = value.pop("pushover_app_token", None)
+                current_ref = current_settings.get(namespace, {}).get("pushover_app_token_ref")
+                if secret_value and (not current_ref or state.get_secret(current_ref) != secret_value):
+                    current_ref = state.put_secret("pushover_app_token", secret_value)
+                if current_ref:
+                    value["pushover_app_token_ref"] = current_ref
+            if namespace == "storage":
+                for key in ("drive_token_path", "drive_credentials_path"):
+                    secret_value = value.pop(key, None)
+                    current_ref = current_settings.get(namespace, {}).get(key + "_ref")
+                    if secret_value and (not current_ref or state.get_secret(current_ref) != secret_value):
+                        current_ref = state.put_secret(key, secret_value)
+                    if current_ref:
+                        value[key + "_ref"] = current_ref
+            state.put_setting(namespace, value)
+        return database
     CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(CONFIG_DIR, stat.S_IRWXU)
     with open(CONFIG_PATH, "w") as f:
@@ -186,6 +235,37 @@ def config_from_dict(raw: dict) -> NomWatchConfig:
 
 
 def load_config() -> Optional[NomWatchConfig]:
+    database = CONFIG_DIR / "nomwatch.sqlite3"
+    if database.exists():
+        try:
+            with contextlib.closing(sqlite3.connect(database)) as conn:
+                conn.row_factory = sqlite3.Row
+                camera = conn.execute("SELECT * FROM cameras ORDER BY id LIMIT 1").fetchone()
+                settings = {row["namespace"]: json.loads(row["value_json"])
+                            for row in conn.execute("SELECT namespace,value_json FROM settings")}
+            if camera:
+                secrets_path = CONFIG_DIR / "secrets.json"
+                secret_values = json.loads(secrets_path.read_text()) if secrets_path.exists() else {}
+                raw = {
+                    "camera": {"ip": camera["host"], "rtsp_port": camera["port"],
+                               "username": camera["username"],
+                               "password": secret_values.get(camera["password_secret_ref"], ""),
+                               "stream_path": camera["stream_path"]},
+                    "bridge": settings.get("bridge", {}),
+                    "detection": settings.get("detection", {}),
+                    "notify": settings.get("notify", {}),
+                    "storage": settings.get("storage", {}),
+                }
+                notify_ref = raw["notify"].pop("pushover_app_token_ref", None)
+                if notify_ref:
+                    raw["notify"]["pushover_app_token"] = secret_values.get(notify_ref)
+                for key in ("drive_token_path", "drive_credentials_path"):
+                    ref = raw["storage"].pop(key + "_ref", None)
+                    if ref:
+                        raw["storage"][key] = secret_values.get(ref)
+                return config_from_dict(raw)
+        except (sqlite3.Error, ValueError, OSError, KeyError):
+            return None
     if not CONFIG_PATH.exists():
         return None
     with open(CONFIG_PATH) as f:

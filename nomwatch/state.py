@@ -324,6 +324,12 @@ class LocalState:
                     value = raw.get(namespace)
                     if isinstance(value, dict):
                         redacted = {k: v for k, v in value.items() if not any(s in k.lower() for s in ("password", "token", "credential", "secret"))}
+                        if namespace == "notify" and value.get("pushover_app_token"):
+                            redacted["pushover_app_token_ref"] = self.put_secret("pushover_app_token", str(value["pushover_app_token"]))
+                        if namespace == "storage":
+                            for key in ("drive_credentials_path", "drive_token_path"):
+                                if value.get(key):
+                                    redacted[key + "_ref"] = self.put_secret(key, str(value[key]))
                         with self.connect() as conn:
                             exists = conn.execute("SELECT 1 FROM settings WHERE namespace=?", (namespace,)).fetchone()
                         if not exists:
