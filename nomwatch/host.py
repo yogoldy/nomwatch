@@ -10,6 +10,7 @@ from .auth import AuthService
 from .config import CONFIG_PATH
 from .control import ControlServer
 from .migration import MigrationCoordinator
+from .network import LanAccessManager, MdnsAdvertiser
 from .paths import NomWatchPaths
 from .state import LocalState
 from .supervisor import HostSupervisor
@@ -32,7 +33,10 @@ def run_host(port: int = 5151) -> None:
     supervisor.start()
     control = ControlServer(paths.runtime / "control.sock", supervisor)
     control.start()
-    app = create_app(state=state, auth=auth, supervisor=supervisor)
+    network = LanAccessManager(state, port, advertiser=MdnsAdvertiser())
+    app = create_app(state=state, auth=auth, supervisor=supervisor, network_manager=network)
+    network.attach_app(app)
+    network.restore()
     server = create_server(app, host="127.0.0.1", port=port, threads=8)
 
     def stop(_signum=None, _frame=None):
@@ -43,5 +47,6 @@ def run_host(port: int = 5151) -> None:
     try:
         server.run()
     finally:
+        network.shutdown()
         control.close()
         supervisor.stop()

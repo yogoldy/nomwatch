@@ -18,7 +18,7 @@ LOCAL_ONLY_PATHS = {
 OPERATOR_MUTATIONS = {
     "/api/start-monitoring", "/api/stop-monitoring", "/api/test-notify",
 }
-OWNER_GET_PREFIXES = ("/setup", "/api/v1/users", "/api/v1/invitations", "/api/v1/sessions")
+OWNER_GET_PREFIXES = ("/setup", "/api/v1/users", "/api/v1/invitations", "/api/v1/sessions", "/api/v1/access/")
 
 LOGIN_PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>NomWatch sign in</title></head>
 <body><main><h1>NomWatch</h1><form method="post" action="/api/v1/auth/login">
@@ -37,7 +37,7 @@ def _payload(request) -> dict:
     return request.get_json(silent=True) or request.form.to_dict()
 
 
-def init_security(app, auth: AuthService) -> None:
+def init_security(app, auth: AuthService, *, allowed_hosts=None) -> None:
     from flask import g, jsonify, make_response, redirect, request
 
     app.extensions["nomwatch_auth"] = auth
@@ -51,13 +51,19 @@ def init_security(app, auth: AuthService) -> None:
     def expected_origin() -> str:
         return f"{request.scheme}://{request.host}"
 
+    def request_origin_class() -> str:
+        host = request.host.lower()
+        hostname = host[1:host.index("]")] if host.startswith("[") and "]" in host else host.split(":", 1)[0]
+        return "loopback" if hostname in {"localhost", "127.0.0.1", "::1"} else "lan"
+
     @app.before_request
     def enforce_security():
         g.nomwatch_session = None
         raw_host = request.host.lower()
         host = raw_host[1:raw_host.index("]")] if raw_host.startswith("[") and "]" in raw_host else raw_host.split(":", 1)[0]
-        if host not in {"localhost", "127.0.0.1", "::1"}:
-            return error("Host is not allowed while NomWatch is loopback-only", 400)
+        permitted = allowed_hosts() if allowed_hosts else {"localhost", "127.0.0.1", "::1"}
+        if host not in permitted:
+            return error("Host is not an active NomWatch listener", 400)
 
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             origin = request.headers.get("Origin")
@@ -73,7 +79,7 @@ def init_security(app, auth: AuthService) -> None:
             return None
 
         token = request.cookies.get(SESSION_COOKIE, "")
-        session = auth.authenticate(token, origin_class="loopback") if token else None
+        session = auth.authenticate(token, origin_class=request_origin_class()) if token else None
         if not session:
             if request.path.startswith("/api/"):
                 return error("authentication required", 401)
@@ -93,6 +99,8 @@ def init_security(app, auth: AuthService) -> None:
             csrf = request.headers.get("X-CSRF-Token") or request.form.get("csrf_token")
             if not auth.verify_csrf(session, csrf or ""):
                 return error("valid CSRF token required", 403)
+            if request.path.startswith("/api/v1/access/") and not auth.recent_reauth(session):
+                return error("recent password reauthentication required", 403)
         if not auth.require_role(session, required):
             return error(f"{required} role required", 403)
         return None
@@ -147,7 +155,7 @@ def init_security(app, auth: AuthService) -> None:
         data = _payload(request)
         try:
             issued = auth.login(str(data.get("username", "")), str(data.get("password", "")),
-                                request.remote_addr or "local", "loopback")
+                                request.remote_addr or "local", request_origin_class())
         except StateError as exc:
             return error(str(exc), 429 if "too many" in str(exc) else 401)
         return issue_response(issued)
@@ -157,7 +165,7 @@ def init_security(app, auth: AuthService) -> None:
         data = _payload(request)
         try:
             issued = auth.accept_invitation(str(data.get("code", "")), str(data.get("username", "")),
-                                            str(data.get("display_name", "")), str(data.get("password", "")), "loopback")
+                                            str(data.get("display_name", "")), str(data.get("password", "")), request_origin_class())
         except (StateError, Exception) as exc:
             return error(str(exc), 422)
         return issue_response(issued, 201)
