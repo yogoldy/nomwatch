@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import signal
+import errno
 from pathlib import Path
 
 from waitress import create_server
@@ -67,7 +68,14 @@ def run_host(port: int = 5151) -> None:
 
         signal.signal(signal.SIGTERM, stop)
         signal.signal(signal.SIGINT, stop)
-        server.run()
+        try:
+            server.run()
+        except OSError as exc:
+            # Waitress wakes its selector by closing the server socket.  On
+            # macOS that can surface as EBADF after Ctrl-C/SIGTERM even though
+            # shutdown succeeded.
+            if exc.errno != errno.EBADF:
+                raise
     except BaseException:
         if cutover and not startup_verified:
             coordinator.rollback_failed_cutover(cutover)
