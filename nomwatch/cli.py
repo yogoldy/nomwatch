@@ -13,7 +13,7 @@ from pathlib import Path
 
 import click
 
-from .bridge import binary_available, rtsp_url, tailscale_status, write_mediamtx_config
+from .bridge import binary_available, local_mediamtx_rtsp_url, rtsp_url, tailscale_status, write_mediamtx_config
 from .clip import build_clip_with_preroll, record_clip
 from .config import (
     BridgeConfig,
@@ -55,8 +55,8 @@ def main():
     """NomWatch: a free, open-source, privacy-first pet feeder camera bridge."""
 
 
-@main.command()
-def setup():
+@main.command("setup-legacy", hidden=True)
+def setup_legacy():
     """Interactive setup wizard: camera details, Tailscale check, bridge config."""
     click.echo("NomWatch setup\n")
 
@@ -288,6 +288,16 @@ def service_status():
 @main.command()
 def service_uninstall():
     """Remove the launchd auto-start service (does not affect any config/data)."""
+    from .paths import NomWatchPaths
+    from .state import LocalState
+    state = LocalState(NomWatchPaths.from_environment())
+    with state.connect() as conn:
+        remote = conn.execute("SELECT desired_enabled,status FROM remote_access WHERE id=1").fetchone()
+    if remote and (remote["desired_enabled"] or remote["status"] == "cleanup_required"):
+        raise click.ClickException(
+            "Remote Access still owns or may require cleanup of a Tailscale Serve mapping; "
+            "disable/diagnose it before uninstalling the host service."
+        )
     error = uninstall_launchd_service()
     click.echo(error or "Removed.")
 
@@ -295,6 +305,15 @@ def service_uninstall():
 @main.command()
 def status():
     """Show current bridge/config health."""
+    from .control import request as control_request
+    from .paths import NomWatchPaths
+    try:
+        result = control_request(NomWatchPaths.from_environment().runtime / "control.sock", "status")
+    except (OSError, ValueError, json.JSONDecodeError):
+        result = None
+    if result:
+        click.echo(json.dumps(result, indent=2, sort_keys=True))
+        return
     cfg = load_config()
     if cfg is None:
         click.echo("No config found. Run `nomwatch setup` first.")
@@ -399,10 +418,10 @@ def detect_test():
             click.echo(f"❌ No feeding event ({verdict}, confidence {result.confidence:.2f}): {result.reason}")
 
 
-@main.command()
+@main.command("worker", hidden=True)
 @click.option("--once", is_flag=True, help="Run a single debounced check cycle then exit (for testing) instead of looping forever.")
-def run(once: bool):
-    """Continuously watch the camera and log feeding events (Ctrl+C to stop)."""
+def worker(once: bool):
+    """Host-owned detection worker. Not a public process-lifecycle command."""
     cfg = load_config()
     if cfg is None:
         click.echo("No config found. Run `nomwatch setup` first.")
@@ -431,7 +450,13 @@ def run(once: bool):
         click.echo("Monitoring is already running elsewhere; refusing to start a duplicate loop.")
         return
 
-    stream_url = rtsp_url(cfg)
+    supervised = os.environ.get("NOMWATCH_SUPERVISED") == "1"
+    stream_url = local_mediamtx_rtsp_url(cfg) if supervised else rtsp_url(cfg)
+    durable_state = None
+    if supervised:
+        from .paths import NomWatchPaths
+        from .state import LocalState
+        durable_state = LocalState(NomWatchPaths.from_environment())
 
     # The vision model is only needed for the ollama/hybrid engines.
     detector = None
@@ -558,6 +583,21 @@ def run(once: bool):
         for event in events:
             ts = datetime.datetime.fromtimestamp(event.timestamp).strftime("%Y-%m-%d %H:%M:%S")
             click.echo(f"🐾 [{ts}] Feeding event confirmed - confidence {event.confidence:.2f}: {event.reasoning}")
+
+            if durable_state is not None:
+                run_at = (
+                    event.timestamp + cfg.detection.clip_post_confirm_seconds
+                    + (cfg.bridge.record_segment_seconds + 1 if cfg.detection.pre_roll_seconds > 0 else 0)
+                )
+                event_id = durable_state.persist_event_with_job(
+                    timestamp=event.timestamp, confidence=event.confidence, reason=event.reasoning,
+                    payload={"timestamp": event.timestamp, "confidence": event.confidence,
+                             "reason": event.reasoning}, run_at=run_at,
+                )
+                click.echo(f"   Persisted event {event_id}; finalization queued.")
+                if once:
+                    break
+                continue
 
             record = {
                 "timestamp": event.timestamp,
@@ -686,9 +726,96 @@ def run(once: bool):
 
 
 @main.command()
+def run():
+    """Compatibility shim: ask the supervised host to start monitoring."""
+    from .control import request as control_request
+    from .paths import NomWatchPaths
+    try:
+        result = control_request(NomWatchPaths.from_environment().runtime / "control.sock", "monitoring.start")
+    except OSError as exc:
+        raise click.ClickException("NomWatch host is not running; start/install `nomwatch host` first") from exc
+    click.echo(json.dumps(result, sort_keys=True))
+
+
+@main.command(hidden=True)
+def jobs():
+    """Run the host-owned durable outbox worker."""
+    from .jobs import run_job_worker
+    run_job_worker()
+
+
+@main.command()
 @click.option("--port", default=5151, type=int)
-def ui(port: int):
-    """Launch the local web UI (first slice: camera + model detection only - see docs/UI_SPEC.md)."""
+def host(port: int):
+    """Run the complete foreground NomWatch service (for launchd/systemd)."""
+    from .host import run_host
+    run_host(port)
+
+
+@main.command()
+def backup():
+    """Create a verified local operational SQLite backup (no media/secrets)."""
+    from .paths import NomWatchPaths
+    from .recovery import create_operational_backup
+    from .state import LocalState
+    location = create_operational_backup(LocalState(NomWatchPaths.from_environment()))
+    click.echo(f"Verified operational backup created: {location}")
+
+
+@main.command("restore-backup")
+@click.argument("backup_dir", type=click.Path(path_type=Path, exists=True, file_okay=False))
+@click.option("--yes", "confirmed", is_flag=True, help="Confirm offline database replacement.")
+def restore_backup(backup_dir: Path, confirmed: bool):
+    """Restore a verified operational backup while the host is stopped."""
+    if not confirmed:
+        raise click.ClickException("restore requires --yes and a stopped NomWatch host")
+    from .paths import NomWatchPaths
+    from .recovery import restore_operational_backup
+    rollback = restore_operational_backup(NomWatchPaths.from_environment(), backup_dir)
+    click.echo(f"Database restored. Previous database preserved under: {rollback}")
+
+
+@main.command()
+@click.option("--json-output", is_flag=True, help="Emit machine-readable JSON.")
+def diagnose(json_output: bool):
+    """Run local recovery, permissions, disk, migration, and cleanup checks."""
+    from .paths import NomWatchPaths
+    from .recovery import diagnostics
+    report = diagnostics(NomWatchPaths.from_environment())
+    if json_output:
+        click.echo(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        click.echo(f"NomWatch recovery status: {report['status']}")
+        for key, value in report.items():
+            if key != "status":
+                click.echo(f"  {key}: {value}")
+
+
+@main.command(hidden=True)
+def maintenance():
+    """Run bounded host state compaction and migration-snapshot retention."""
+    from .paths import NomWatchPaths
+    from .recovery import compact_state, prune_migration_backups
+    from .state import LocalState
+    paths = NomWatchPaths.from_environment()
+    result = compact_state(LocalState(paths))
+    result["migration_backups_removed"] = prune_migration_backups(paths)
+    click.echo(json.dumps(result, sort_keys=True))
+
+
+@main.command()
+@click.option("--port", default=None, type=int, help="Explicit loopback development server port.")
+def ui(port: int | None):
+    """Report the supervised host URL, or run an explicit loopback dev UI."""
+    if port is None:
+        from .control import request as control_request
+        from .paths import NomWatchPaths
+        try:
+            control_request(NomWatchPaths.from_environment().runtime / "control.sock", "status")
+        except OSError as exc:
+            raise click.ClickException("NomWatch host is not running; start/install `nomwatch host` first") from exc
+        click.echo("NomWatch is available at http://127.0.0.1:5151/")
+        return
     try:
         from .webui import run_ui
     except ImportError:
@@ -697,6 +824,18 @@ def ui(port: int):
 
     click.echo(f"Starting NomWatch UI at http://127.0.0.1:{port} (Ctrl+C to stop)")
     run_ui(port=port)
+
+
+@main.command()
+def setup():
+    """Open the authenticated setup flow served by the running host."""
+    from .control import request as control_request
+    from .paths import NomWatchPaths
+    try:
+        control_request(NomWatchPaths.from_environment().runtime / "control.sock", "status")
+    except OSError as exc:
+        raise click.ClickException("NomWatch host is not running; start/install `nomwatch host` first") from exc
+    click.echo("Open http://127.0.0.1:5151/setup in a browser.")
 
 
 def _path_stats(path: Path) -> tuple[int, int]:

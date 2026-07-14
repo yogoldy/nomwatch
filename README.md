@@ -42,7 +42,7 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full security model a
 
 ```bash
 pip install nomwatch
-nomwatch setup
+nomwatch host
 ```
 
 The setup wizard will ask for:
@@ -51,7 +51,14 @@ The setup wizard will ask for:
 - Your Google Drive folder (via OAuth) for event clips
 - Your ntfy/Pushover details for notifications
 
-Everything else — MediaMTX install/config, Tailscale serve setup, auto-start service — is handled for you.
+Open the printed loopback claim URL, create the first owner, then finish camera
+setup in the authenticated UI. LAN access remains off until the owner stages
+and confirms a selected private interface. Optional Tailscale access is
+configured from the Access page and always targets the authenticated gateway;
+NomWatch never enables Funnel or public exposure.
+
+For an installed service, use the exact macOS LaunchAgent or Raspberry Pi OS
+systemd artifacts described in [the operator guide](docs/OPERATOR_GUIDE.md).
 
 ## Contributing
 

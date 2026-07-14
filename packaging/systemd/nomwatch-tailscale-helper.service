@@ -1,0 +1,27 @@
+[Unit]
+Description=NomWatch fixed-operation Tailscale helper
+After=tailscaled.service
+Wants=tailscaled.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/bin/nomwatch-tailscale-helper
+Restart=on-failure
+RestartSec=5s
+RuntimeDirectory=nomwatch
+RuntimeDirectoryMode=0750
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/nomwatch
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

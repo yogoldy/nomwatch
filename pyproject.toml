@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nomwatch"
-version = "0.4.0"
+dynamic = ["version"]
 description = "Free, open-source, privacy-first camera bridge that turns any LAN camera into a smart pet feeder monitor."
 readme = "README.md"
-license = { text = "MIT" }
-requires-python = ">=3.9"
+license = "MIT"
+requires-python = ">=3.10"
 authors = [
     { name = "Leo Goldberg" }
 ]
@@ -17,10 +17,14 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: End Users/Desktop",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: MacOS",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Home Automation",
     "Topic :: Multimedia :: Video :: Capture",
 ]
@@ -28,6 +32,11 @@ dependencies = [
     "pyyaml>=6.0",
     "click>=8.1",
     "requests>=2.31",
+    "flask>=3.0",
+    "waitress>=3.0",
+    "argon2-cffi>=23.1",
+    "zeroconf>=0.147",
+    "qrcode[pil]>=8.2",
 ]
 
 [project.urls]
@@ -38,10 +47,17 @@ Issues = "https://github.com/yogoldy/nomwatch/issues"
 [project.optional-dependencies]
 drive = ["google-api-python-client>=2.100", "google-auth-oauthlib>=1.1"]
 detect = ["ultralytics>=8.0"]
-ui = ["flask>=3.0"]
+ui = []
 
 [project.scripts]
 nomwatch = "nomwatch.cli:main"
+nomwatch-tailscale-helper = "nomwatch.tailscale_helper:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "nomwatch.__version__"}
 
 [tool.setuptools.packages.find]
 include = ["nomwatch*"]
+
+[tool.setuptools.package-data]
+nomwatch = ["static/*"]
