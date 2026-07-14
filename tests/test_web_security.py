@@ -52,6 +52,24 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(response.status_code, 403)
         self.assertIn("local OS", response.get_json()["error"])
 
+    def test_loopback_alias_origin_is_accepted_but_non_loopback_is_rejected(self):
+        response = self.client.post("/api/v1/auth/claim", data={
+            "code": self.code, "username": "owner", "display_name": "Owner",
+            "password": "correct horse battery",
+        }, base_url="http://127.0.0.1:5151", headers={"Origin": "http://localhost:5151"})
+        self.assertEqual(response.status_code, 201, response.get_data(as_text=True))
+
+        other = self.app.test_client()
+        self.assertEqual(other.post("/api/v1/auth/login", data={"username": "owner", "password": "correct horse battery"},
+                                    base_url="http://127.0.0.1:5151", headers={"Origin": "http://evil.example:5151"}).status_code, 403)
+        self.assertEqual(other.post("/api/v1/auth/login", data={"username": "owner", "password": "correct horse battery"},
+                                    base_url="http://127.0.0.1:5151", headers={"Origin": "http://127.0.0.1:not-a-port"}).status_code, 403)
+
+    def test_first_owner_page_is_a_host_setup_flow(self):
+        page = self.client.get("/claim").get_data(as_text=True)
+        self.assertIn("This computer is the host", page)
+        self.assertIn("Create owner account", page)
+
     def test_role_matrix_and_invitation(self):
         csrf = self.claim()
         invitation = self.client.post("/api/v1/invitations", json={"role": "viewer"},

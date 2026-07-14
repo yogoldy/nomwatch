@@ -804,9 +804,9 @@ def maintenance():
 
 
 @main.command()
-@click.option("--port", default=None, type=int, help="Explicit loopback development server port.")
+@click.option("--port", default=None, type=int, help="Loopback host port (default: 5151).")
 def ui(port: int | None):
-    """Report the supervised host URL, or run an explicit loopback dev UI."""
+    """Report the host URL, or start the complete local host in the foreground."""
     if port is None:
         from .control import request as control_request
         from .paths import NomWatchPaths
@@ -816,14 +816,12 @@ def ui(port: int | None):
             raise click.ClickException("NomWatch host is not running; start/install `nomwatch host` first") from exc
         click.echo("NomWatch is available at http://127.0.0.1:5151/")
         return
-    try:
-        from .webui import run_ui
-    except ImportError:
-        click.echo("The web UI requires Flask. Install it with: pip install nomwatch[ui]")
-        return
-
-    click.echo(f"Starting NomWatch UI at http://127.0.0.1:{port} (Ctrl+C to stop)")
-    run_ui(port=port)
+    # `ui --port` used to start a development-only Flask server.  That bypassed
+    # host supervision and did not issue the first-owner bootstrap code.  Keep
+    # the familiar command but always use the production host path.
+    from .host import run_host
+    click.echo(f"Starting NomWatch host at http://127.0.0.1:{port} (Ctrl+C to stop)")
+    run_host(port=port)
 
 
 @main.command()

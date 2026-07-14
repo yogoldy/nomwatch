@@ -20,17 +20,37 @@ OPERATOR_MUTATIONS = {
 }
 OWNER_GET_PREFIXES = ("/setup", "/api/v1/users", "/api/v1/invitations", "/api/v1/sessions", "/api/v1/access/")
 
-LOGIN_PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>NomWatch sign in</title></head>
-<body><main><h1>NomWatch</h1><form method="post" action="/api/v1/auth/login">
-<label>Username <input name="username" autocomplete="username" required></label>
-<label>Password <input name="password" type="password" autocomplete="current-password" required></label>
-<button type="submit">Sign in</button></form></main></body></html>"""
+AUTH_SHELL = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title><style>
+:root {{ color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+* {{ box-sizing: border-box; }} body {{ margin: 0; min-height: 100vh; color: #edf4f1; background: radial-gradient(circle at 15% 15%, #1a5d50 0, transparent 31rem), radial-gradient(circle at 92% 88%, #183f63 0, transparent 28rem), #0d1718; display: grid; place-items: center; padding: 24px; }}
+main {{ width: min(100%, 510px); border: 1px solid #315453; border-radius: 22px; padding: 38px; background: rgba(16, 31, 32, .94); box-shadow: 0 24px 80px rgba(0,0,0,.35); }}
+.mark {{ width: 42px; height: 42px; border-radius: 13px; display: grid; place-items: center; color: #09201b; background: #7de5be; font-size: 25px; font-weight: 800; margin-bottom: 22px; }} h1 {{ margin: 0; font-size: 29px; letter-spacing: -.04em; }}
+.eyebrow {{ color: #7de5be; font-size: 12px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; margin: 0 0 10px; }} p {{ color: #b5c8c4; line-height: 1.55; }} form {{ display: grid; gap: 16px; margin-top: 27px; }} label {{ display: grid; gap: 7px; color: #d5e2df; font-size: 14px; font-weight: 650; }}
+input {{ width: 100%; border: 1px solid #45615d; background: #0b1415; color: #f4faf8; border-radius: 10px; padding: 12px 13px; font: inherit; }} input:focus {{ outline: 3px solid rgba(125,229,190,.22); border-color: #7de5be; }}
+button {{ border: 0; border-radius: 10px; padding: 13px 16px; cursor: pointer; font: inherit; font-weight: 800; color: #082019; background: #7de5be; }} button:disabled {{ opacity: .55; cursor: wait; }} .notice {{ min-height: 22px; margin: 3px 0 0; color: #ffb9a9; font-size: 14px; }}
+.quiet {{ margin-top: 24px; font-size: 13px; }} code {{ color: #d7f8e9; }} @media (max-width: 520px) {{ main {{ padding: 29px 23px; }} }}
+</style></head><body><main><div class="mark">N</div>{body}</main>
+<script>(function() {{ const form=document.querySelector('form[data-auth]'); if (!form) return; const notice=document.querySelector('.notice'); form.addEventListener('submit', async function(event) {{ event.preventDefault(); notice.textContent=''; const button=form.querySelector('button'); button.disabled=true; const original=button.textContent; button.textContent='Working…'; try {{ const response=await fetch(form.action, {{method:'POST', headers:{{Accept:'application/json'}}, body:new FormData(form)}}); const data=await response.json(); if (!response.ok) throw new Error(data.error || 'That did not work. Please try again.'); window.location.assign(form.dataset.next); }} catch (error) {{ notice.textContent=error.message; button.disabled=false; button.textContent=original; }} }}); }}());</script></body></html>"""
 
-CLAIM_PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>Claim NomWatch</title></head>
-<body><main><h1>Create the first owner</h1><p>This page is available on loopback only. Enter the code printed by <code>nomwatch host</code>.</p>
-<form method="post" action="/api/v1/auth/claim"><label>Claim code <input name="code" required></label>
-<label>Username <input name="username" required></label><label>Display name <input name="display_name"></label>
-<label>Password <input name="password" type="password" minlength="12" required></label><button>Create owner</button></form></main></body></html>"""
+LOGIN_PAGE = AUTH_SHELL.format(title="Sign in to NomWatch", body="""
+<p class="eyebrow">Local host</p><h1>Welcome back</h1><p>Sign in to manage this NomWatch host.</p>
+<form data-auth data-next="/" method="post" action="/api/v1/auth/login">
+<label>Username <input name="username" autocomplete="username" required autofocus></label>
+<label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+<p class="notice" role="alert"></p><button type="submit">Sign in</button></form>
+<p class="quiet">This is a local NomWatch account, separate from your camera-app login.</p>""")
+
+CLAIM_PAGE = AUTH_SHELL.format(title="Set up your NomWatch host", body="""
+<p class="eyebrow">This computer is the host</p><h1>Create the owner account</h1><p>You are setting up the account that controls this NomWatch host. The one-time setup code was printed when the host started.</p>
+<form data-auth data-next="/setup" method="post" action="/api/v1/auth/claim">
+<label>Host setup code <input name="code" autocomplete="one-time-code" required autofocus></label>
+<label>Username <input name="username" autocomplete="username" required></label>
+<label>Display name <input name="display_name" autocomplete="name" placeholder="Optional"></label>
+<label>Password <input name="password" type="password" autocomplete="new-password" minlength="12" required></label>
+<p class="notice" role="alert"></p><button type="submit">Create owner account</button></form>
+<p class="quiet">The setup code works only on this computer and expires after 15 minutes. It is not a camera password.</p>""")
 
 
 def _payload(request) -> dict:
@@ -50,6 +70,30 @@ def init_security(app, auth: AuthService, *, allowed_hosts=None, listener_policy
 
     def expected_origin() -> str:
         return f"{request.scheme}://{request.host}"
+
+    def origin_is_allowed(origin: str) -> bool:
+        """Accept the exact origin, plus equivalent loopback hostnames.
+
+        Browsers and local launchers sometimes switch between localhost and
+        127.0.0.1.  They are the same local security boundary, but the old
+        literal string comparison turned that harmless switch into a failed
+        first-owner claim.
+        """
+        from urllib.parse import urlsplit
+
+        try:
+            expected = urlsplit(expected_origin())
+            supplied = urlsplit(origin)
+            expected_port = expected.port or (443 if expected.scheme == "https" else 80)
+            supplied_port = supplied.port or (443 if supplied.scheme == "https" else 80)
+        except ValueError:
+            return False
+        if supplied.scheme != expected.scheme or supplied.username or supplied.password:
+            return False
+        loopback = {"localhost", "127.0.0.1", "::1"}
+        expected_host = (expected.hostname or "").lower()
+        supplied_host = (supplied.hostname or "").lower()
+        return (supplied_host == expected_host or (supplied_host in loopback and expected_host in loopback)) and supplied_port == expected_port
 
     def request_origin_class() -> str:
         host = request.host.lower()
@@ -71,7 +115,7 @@ def init_security(app, auth: AuthService, *, allowed_hosts=None, listener_policy
 
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             origin = request.headers.get("Origin")
-            if origin and origin.rstrip("/") != expected_origin().rstrip("/"):
+            if origin and not origin_is_allowed(origin):
                 return error("Origin is not allowed", 403)
             fetch_site = request.headers.get("Sec-Fetch-Site")
             if fetch_site and fetch_site not in {"same-origin", "none"}:
